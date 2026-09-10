@@ -31,6 +31,7 @@ import {
 import { useSubtitleSettingsSync } from "../../lib/useSubtitleSettingsSync";
 import type { CaptionTrack, StreamVariant } from "../../types/video";
 import { SubtitleOverlay } from "../player/SubtitleOverlay";
+import { StatsForNerds } from "../player/StatsForNerds";
 import { MediaScrubber } from "../ui/MediaScrubber";
 
 interface ShortVideoSurfaceProps {
@@ -44,6 +45,7 @@ interface ShortVideoSurfaceProps {
   poster?: string;
   active: boolean;
   muted: boolean;
+  volume: number;
   playbackMode: string;
   autoScrollSeconds: number;
   onRequestAdvance?: () => void;
@@ -103,6 +105,7 @@ export function ShortVideoSurface({
   poster,
   active,
   muted,
+  volume,
   playbackMode,
   autoScrollSeconds,
   onRequestAdvance,
@@ -121,9 +124,18 @@ export function ShortVideoSurface({
   const autoAdvanceFiredRef = useRef(false);
   const lastAudioResyncAtRef = useRef(0);
   const mutedRef = useRef(muted);
+  const volumeRef = useRef(volume);
   useEffect(() => {
     mutedRef.current = muted;
   }, [muted]);
+
+  useEffect(() => {
+    volumeRef.current = volume;
+    const video = videoRef.current;
+    const audio = audioRef.current;
+    if (video) video.volume = volume;
+    if (audio) audio.volume = volume;
+  }, [volume]);
   const [fit, setFit] = useState<"cover" | "contain">("cover");
   const [userPaused, setUserPaused] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -153,11 +165,9 @@ export function ShortVideoSurface({
   const longPressPlaybackRate = normalizePlaybackRate(longPressSpeedSetting, 2);
   const speedOptions = parseCustomSpeedPresets(customSpeedPresets, customSpeedsEnabled);
   const selectedCaption = captions.find((caption) => caption.id === selectedCaptionId) ?? null;
+  const selectedVariant = qualities.find((quality) => quality.id === selectedQualityId) ?? null;
   const selectedQualityLabel =
-    selectedQualityId === "auto"
-      ? "Auto"
-      : qualities.find((quality) => quality.id === selectedQualityId)?.qualityLabel ||
-        selectedQualityId;
+    selectedQualityId === "auto" ? "Auto" : selectedVariant?.qualityLabel || selectedQualityId;
 
   const useDirect = !!videoUrl;
   const hasSeparateAudio = useDirect && !!audioUrl && audioUrl !== videoUrl;
@@ -263,12 +273,13 @@ export function ShortVideoSurface({
       video.src = videoUrl;
       video.loop = shouldLoop && !hasSeparateAudio;
       video.muted = hasSeparateAudio ? true : mutedRef.current;
+      video.volume = volumeRef.current;
 
       if (audio && hasSeparateAudio && audioUrl) {
         audio.src = audioUrl;
         audio.loop = shouldLoop;
         audio.muted = mutedRef.current;
-        audio.volume = 1;
+        audio.volume = volumeRef.current;
         audio.playbackRate = playbackRate;
         audio.preservesPitch = true;
       }
@@ -352,6 +363,7 @@ export function ShortVideoSurface({
       teardown();
       video.loop = shouldLoop;
       video.muted = mutedRef.current;
+      video.volume = volumeRef.current;
       const player = dashjs.MediaPlayer().create();
       const dashEvents = dashjs.MediaPlayer.events;
       const playDash = () => {
@@ -600,6 +612,16 @@ export function ShortVideoSurface({
     },
     [duration, hasSeparateAudio],
   );
+
+  useEffect(() => {
+    if (!active) return;
+    const handleExternalSeek = (event: Event) => {
+      const detail = (event as CustomEvent<{ time?: number }>).detail;
+      if (typeof detail?.time === "number") seekTo(detail.time);
+    };
+    window.addEventListener("flow-player-seek", handleExternalSeek);
+    return () => window.removeEventListener("flow-player-seek", handleExternalSeek);
+  }, [active, seekTo]);
 
   return (
     <div className="relative h-full w-full">
@@ -895,21 +917,18 @@ export function ShortVideoSurface({
         </div>
       )}
       {statsVisible && (
-        <div className="pointer-events-none absolute right-4 top-16 z-40 w-[min(82vw,300px)] rounded-xl border border-chrome-white/10 bg-chrome-black/85 p-3 text-xs font-semibold text-chrome-zinc-100">
-          <div className="mb-2 text-sm font-black">Stats for nerds</div>
-          <div className="grid grid-cols-[96px_1fr] gap-x-3 gap-y-1 text-chrome-zinc-300">
-            <span className="text-chrome-zinc-500">Time</span>
-            <span>{formatTime(progress)} / {formatTime(duration)}</span>
-            <span className="text-chrome-zinc-500">Speed</span>
-            <span>{playbackRate}x</span>
-            <span className="text-chrome-zinc-500">Quality</span>
-            <span>{selectedQualityLabel}</span>
-            <span className="text-chrome-zinc-500">Resolution</span>
-            <span>{videoRef.current ? `${videoRef.current.videoWidth}x${videoRef.current.videoHeight}` : "Unknown"}</span>
-            <span className="text-chrome-zinc-500">Captions</span>
-            <span>{captions.length}</span>
-          </div>
-        </div>
+        <StatsForNerds
+          videoRef={videoRef}
+          currentTime={progress}
+          duration={duration}
+          playbackRate={playbackRate}
+          qualityLabel={selectedQualityLabel}
+          mimeType={selectedVariant?.mimeType}
+          bitrate={selectedVariant?.bitrate}
+          captionCount={captions.length}
+          compact
+          className="right-4 top-16"
+        />
       )}
       <audio ref={audioRef} preload="auto" />
     </div>
