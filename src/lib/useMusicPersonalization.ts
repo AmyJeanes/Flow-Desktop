@@ -519,7 +519,6 @@ function planSections(profile: MusicTasteProfile | null, b: BuiltSections): Pers
 
 export function useMusicPersonalization(): MusicPersonalization {
   const currentTrack = useMusicPlayerStore((s) => s.currentTrack);
-  const currentTrackId = currentTrack ? songIdOf(currentTrack) : null;
 
   const [quickPicks, setQuickPicks] = useState<SongItem[]>([]);
   const [sections, setSections] = useState<PersonalSection[]>([]);
@@ -583,6 +582,9 @@ export function useMusicPersonalization(): MusicPersonalization {
     })();
   }, []);
 
+  // Build once per home load, seeded from whatever is playing at that moment. Deliberately
+  // NOT keyed on the current track: rebuilding every time playback advances would yank the
+  // shelf out from under a tap (each pick now springboards its own radio, so the shelf stays put).
   useEffect(() => {
     const req = ++quickReqRef.current;
     (async () => {
@@ -591,7 +593,7 @@ export function useMusicPersonalization(): MusicPersonalization {
       if (quickReqRef.current !== req) return;
       setQuickPicks(picks);
     })();
-  }, [currentTrackId, dataVersion]);
+  }, [dataVersion]);
 
   return { quickPicks, sections, loading };
 }

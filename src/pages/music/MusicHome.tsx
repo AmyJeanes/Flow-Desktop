@@ -35,6 +35,7 @@ export default function MusicHome() {
   const navigate = useNavigate();
   const playQueue = useMusicPlayerStore((s) => s.playQueue);
   const addToQueue = useMusicPlayerStore((s) => s.addToQueue);
+  const startRadio = useMusicPlayerStore((s) => s.startRadio);
   const { data, loading, error, reload, loadMore, hasMore, loadingMore } = useMusicHome();
   const personalization = useMusicPersonalization();
   const isHidden = useMusicHiddenFilter();
@@ -197,7 +198,7 @@ export default function MusicHome() {
                   variant="track-list"
                   item={track}
                   className="snap-start bg-surface-container-low pr-3"
-                  onPlay={() => playTrack(track, quickPicks)}
+                  onPlay={() => void startRadio(track)}
                   onMenu={() => addToQueue(track)}
                 />
               ))}
