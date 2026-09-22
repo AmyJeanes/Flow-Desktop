@@ -1,5 +1,6 @@
 import { getSetting, setSetting } from "./api/db";
 import { getPlaylistDetails } from "./api/youtube";
+import { moveAfterId } from "./listOrder";
 import { withPublishedAt } from "./publishedDate";
 import type { PlaylistSummary, VideoSummary } from "../types/video";
 
@@ -223,6 +224,21 @@ export const updateStoredPlaylistTracks = async (
 export const storedPlaylistThumbnail = (tracks: VideoSummary[]) =>
   tracks.map((track) => track.thumbnailUrl).find(Boolean) ?? null;
 
+/** Remove a video from any stored playlist (Watch Later or an owned playlist). */
+export const removeVideoFromStoredPlaylist = (playlistId: string, videoId: string) =>
+  updateStoredPlaylistTracks(playlistId, (tracks) =>
+    tracks.some((track) => track.id === videoId)
+      ? tracks.filter((track) => track.id !== videoId)
+      : tracks,
+  );
+
+/** Move one track to sit right after another (or first, when `afterId` is null). */
+export const moveStoredPlaylistTrack = (
+  playlistId: string,
+  videoId: string,
+  afterId: string | null,
+) => updateStoredPlaylistTracks(playlistId, (tracks) => moveAfterId(tracks, videoId, afterId));
+
 export const persistStoredPlaylists = async (playlists: StoredPlaylist[]) => {
   const now = Date.now();
   const stamped = playlists.map((playlist) => ({
@@ -387,20 +403,6 @@ export const addVideoToWatchLater = async (video: VideoSummary) => {
 };
 
 export const removeVideoFromWatchLater = async (videoId: string) => {
-  const playlists = await loadStoredPlaylists();
-  const nextPlaylists = playlists.map((playlist) => {
-    if (playlist.id !== WATCH_LATER_PLAYLIST_ID) return playlist;
-
-    const tracks = playlist.tracks.filter((track) => track.id !== videoId);
-    return normalizePlaylist({
-      ...playlist,
-      tracks,
-      thumbnailUrl: tracks.map((track) => track.thumbnailUrl).find(Boolean) ?? null,
-      videoCount: tracks.length > 0 ? tracks.length : null,
-      videoCountText: tracks.length > 0 ? formatVideoCountText(tracks.length) : null,
-    });
-  });
-
-  await persistStoredPlaylists(nextPlaylists);
+  await removeVideoFromStoredPlaylist(WATCH_LATER_PLAYLIST_ID, videoId);
   return getStoredPlaylistById(WATCH_LATER_PLAYLIST_ID);
 };
