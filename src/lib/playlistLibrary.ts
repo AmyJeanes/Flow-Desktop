@@ -202,7 +202,7 @@ export const updateStoredPlaylistTracks = async (
     id: current.id,
     name: current.name,
     tracks: nextTracks,
-    thumbnailUrl: nextTracks[0]?.thumbnailUrl ?? current.thumbnailUrl ?? null,
+    thumbnailUrl: storedPlaylistThumbnail(nextTracks),
     // A saved playlist stores only its first page; keep its full remote count.
     ...(current.source === "Saved"
       ? {}
@@ -219,6 +219,9 @@ export const updateStoredPlaylistTracks = async (
   await persistStoredPlaylists(nextPlaylists);
   return updated;
 };
+
+export const storedPlaylistThumbnail = (tracks: VideoSummary[]) =>
+  tracks.map((track) => track.thumbnailUrl).find(Boolean) ?? null;
 
 export const persistStoredPlaylists = async (playlists: StoredPlaylist[]) => {
   const now = Date.now();

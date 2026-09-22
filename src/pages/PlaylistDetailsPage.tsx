@@ -75,6 +75,7 @@ export function PlaylistDetailsPage({
   const isOwned = storedPlaylist?.source === "Owned" && !isProtected;
   const isLocalPlaylist = savedInLibrary || isProtected;
   const sortOrder = resolvePlaylistSortOrder(storedSortOrder, isLocalPlaylist);
+  const editable = isProtected || isOwned;
 
   const displayVideos = useMemo(
     () => sortPlaylistVideos(videos, sortOrder, isProtected),
@@ -251,6 +252,7 @@ export function PlaylistDetailsPage({
           displayVideos={displayVideos}
           sortOrder={sortOrder}
           sortOptions={availablePlaylistSortOrders(isLocalPlaylist)}
+          editable={editable}
           onSortChange={handleSortChange}
           onReorder={handleReorder}
           onPlay={playFromPlaylist}

@@ -605,9 +605,7 @@ function VideoCardComponent({
           >
             <GripHorizontal size={20} strokeWidth={2.5} />
           </button>
-        ) : (
-          <div className="w-7 shrink-0" aria-hidden="true" />
-        )}
+        ) : null}
 
         <div
           className="relative aspect-video w-40 shrink-0 cursor-pointer overflow-hidden rounded-xl bg-chrome-zinc-900 sm:w-48"
