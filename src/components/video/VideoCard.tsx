@@ -303,6 +303,9 @@ function VideoCardComponent({
     const player = usePlayerStore.getState();
     const isDuplicate = player.currentVideo?.id === video.id
       || player.queue.some((item) => item.id === video.id);
+    // With nothing playing, addToQueue starts the video in the mini player
+    // instead of queuing it invisibly — reflect that in the toast.
+    const startsPlayback = !player.currentVideo && player.queue.length === 0;
 
     if (onAddToQueue) {
       onAddToQueue(video);
@@ -310,10 +313,12 @@ function VideoCardComponent({
       player.addToQueue(video);
     }
 
-    showToast({
-      variant: isDuplicate ? "info" : "success",
-      message: getString(isDuplicate ? "queue_duplicate_toast" : "queue_added_toast"),
-    });
+    const message = isDuplicate
+      ? "queue_duplicate_toast"
+      : startsPlayback
+        ? "queue_started_toast"
+        : "queue_added_toast";
+    showToast({ variant: isDuplicate ? "info" : "success", message: getString(message) });
   };
 
   const handleDownloadAction = async () => {
@@ -592,7 +597,7 @@ function VideoCardComponent({
         {showDragHandle ? (
           <button
             type="button"
-            aria-label="Reorder video"
+            aria-label={getString('reorder_item', video.title)}
             className={[
               'shrink-0 rounded-md p-1 text-chrome-neutral-500 transition-colors duration-200 ease-out',
               'hover:text-chrome-neutral-300',
