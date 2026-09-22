@@ -43,17 +43,12 @@ export function PlaylistDetailsPage({
     storedPlaylist,
     meta,
     videos,
+    setVideos,
   } = usePlaylistDetails(playlistId);
   usePublishTitle(meta?.title);
 
   const [sortType, setSortType] = useState<PlaylistSortType>("Manual");
-  const [manualVideos, setManualVideos] = useState<VideoSummary[]>([]);
   const [savedInLibrary, setSavedInLibrary] = useState(false);
-
-  useEffect(() => {
-    setManualVideos(videos);
-    setSortType("Manual");
-  }, [videos]);
 
   useEffect(() => {
     setSavedInLibrary(Boolean(storedPlaylist));
@@ -65,11 +60,11 @@ export function PlaylistDetailsPage({
   const isOwned = storedPlaylist?.source === "Owned" && !isProtected;
 
   const displayVideos = useMemo(
-    () => sortPlaylistVideos(manualVideos, sortType),
-    [manualVideos, sortType],
+    () => sortPlaylistVideos(videos, sortType),
+    [videos, sortType],
   );
 
-  const leadVideo = manualVideos[0];
+  const leadVideo = videos[0];
   const heroThumbnailUrl = leadVideo?.thumbnailUrl ?? meta?.thumbnailUrl ?? null;
 
   const startPlaylistDownload = useCollectionDownloadStore((state) => state.startPlaylist);
@@ -89,7 +84,7 @@ export function PlaylistDetailsPage({
   };
 
   const handleReorder = async (nextVideos: VideoSummary[]) => {
-    setManualVideos(nextVideos);
+    setVideos(nextVideos);
     if (storedPlaylist) {
       await updateStoredPlaylistTracks(storedPlaylist.id, nextVideos);
     }
@@ -233,7 +228,7 @@ export function PlaylistDetailsPage({
         />
 
         <PlaylistSortableList
-          videos={manualVideos}
+          videos={videos}
           displayVideos={displayVideos}
           sortType={sortType}
           onSortChange={setSortType}

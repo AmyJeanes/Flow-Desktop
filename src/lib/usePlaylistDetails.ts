@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getPlaylistDetails } from "./api/youtube";
 import {
   formatVideoCountText,
@@ -6,8 +6,14 @@ import {
   isProtectedPlaylistId,
   normalizePlaylist,
   resolvePlaylistTitle,
+  updateStoredPlaylistTracks,
   type StoredPlaylist,
 } from "./playlistLibrary";
+import {
+  applyMetadataPatches,
+  fetchMetadataPatches,
+  selectHydrationTargets,
+} from "./playlistMetadata";
 import type { VideoSummary } from "../types/video";
 
 export interface PlaylistDetailsMeta {
@@ -38,6 +44,8 @@ export function usePlaylistDetails(playlistId: string | undefined) {
 
     setLoading(true);
     setError(null);
+    // Cleared so the back-fill never pairs the old list with the new playlist.
+    setVideos([]);
 
     try {
       const stored = await getStoredPlaylistById(playlistId);
@@ -126,6 +134,39 @@ export function usePlaylistDetails(playlistId: string | undefined) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Tried tracks that stay incomplete aren't retried while the page is open.
+  const attempted = useRef<{ playlistId: string | undefined; ids: Set<string> }>({
+    playlistId,
+    ids: new Set(),
+  });
+
+  useEffect(() => {
+    if (!playlistId || storedPlaylist?.id !== playlistId) return;
+    if (attempted.current.playlistId !== playlistId) {
+      attempted.current = { playlistId, ids: new Set() };
+    }
+    const attemptedIds = attempted.current.ids;
+    const targets = selectHydrationTargets(videos, attemptedIds);
+    if (targets.length === 0) return;
+    for (const id of targets) attemptedIds.add(id);
+
+    void (async () => {
+      try {
+        const patches = await fetchMetadataPatches(targets);
+        if (patches.size === 0) return;
+
+        setVideos((previous) => applyMetadataPatches(previous, patches).videos);
+        // Applied to what's stored now, so a reorder or removal meanwhile survives.
+        await updateStoredPlaylistTracks(
+          playlistId,
+          (tracks) => applyMetadataPatches(tracks, patches).videos,
+        );
+      } catch (hydrateError) {
+        console.warn("Failed to back-fill playlist metadata", hydrateError);
+      }
+    })();
+  }, [videos, playlistId, storedPlaylist?.id]);
 
   return {
     loading,
