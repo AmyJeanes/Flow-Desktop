@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getPlaylistDetails, getVideoDetails } from "./api/youtube";
+import { uniqueById } from "./listOrder";
 import {
   formatVideoCountText,
   getStoredPlaylistById,
   isProtectedPlaylistId,
   normalizePlaylist,
   resolvePlaylistTitle,
+  storedPlaylistThumbnail,
   updateStoredPlaylistTracks,
   type StoredPlaylist,
 } from "./playlistLibrary";
@@ -64,7 +66,7 @@ export function usePlaylistDetails(playlistId: string | undefined) {
       if (!isProtectedPlaylistId(playlistId)) {
         try {
           const details = await getPlaylistDetails(playlistId);
-          remoteVideos = details.videos ?? [];
+          remoteVideos = uniqueById(details.videos ?? []);
           remoteTitle = details.title;
           remoteChannel = details.channelName || remoteChannel;
           remoteDescription = details.description ?? null;
@@ -78,9 +80,27 @@ export function usePlaylistDetails(playlistId: string | undefined) {
         }
       }
 
-      const resolvedVideos = normalizedStored?.tracks.length
-        ? normalizedStored.tracks
-        : remoteVideos;
+      // A saved playlist is a first-page snapshot of a live one: show the fresh
+      // remote list, and use the snapshot only as the offline fallback and as a
+      // cache of metadata already back-filled (see the hydration effect).
+      // Owned/protected lists are local-only, so their stored tracks stay
+      // authoritative.
+      const preferRemote = normalizedStored?.source === "Saved" && remoteVideos.length > 0;
+      const resolvedVideos = preferRemote && normalizedStored
+        ? withStoredMetadata(remoteVideos, normalizedStored.tracks)
+        : normalizedStored?.tracks.length
+          ? normalizedStored.tracks
+          : remoteVideos;
+
+      // Keep the snapshot current with the live first page: it is the offline
+      // fallback, the cache the hydration effect persists into, and the source
+      // of the library card's thumbnail, which otherwise stays broken once the
+      // first video is removed. Awaited so the hydration persist follows it.
+      if (preferRemote && normalizedStored && !snapshotMatches(normalizedStored, resolvedVideos)) {
+        await updateStoredPlaylistTracks(playlistId, resolvedVideos).catch((snapshotError) => {
+          console.warn("Failed to refresh stored playlist snapshot", snapshotError);
+        });
+      }
 
       const videoCount = resolvedVideos.length
         || remoteCount
@@ -198,6 +218,28 @@ export function usePlaylistDetails(playlistId: string | undefined) {
     setVideos,
     reload: load,
   };
+}
+
+/**
+ * Remote values win; fields the remote list lacks keep what enrichment stored. A video new to the
+ * snapshot is stamped as added now, like one saved with the playlist.
+ */
+function withStoredMetadata(remote: VideoSummary[], stored: VideoSummary[]) {
+  const storedById = new Map(stored.map((track) => [track.id, track]));
+  const addedAt = Date.now();
+  return remote.map((video) => {
+    const storedTrack = storedById.get(video.id);
+    if (!storedTrack) return { ...video, addedAtInPlaylist: addedAt };
+    return applyVideoDetails([storedTrack], new Map([[video.id, video]]))[0] ?? video;
+  });
+}
+
+function snapshotMatches(stored: StoredPlaylist, tracks: VideoSummary[]) {
+  return (
+    stored.tracks.length === tracks.length &&
+    stored.tracks.every((track, index) => track.id === tracks[index]?.id) &&
+    stored.thumbnailUrl === storedPlaylistThumbnail(tracks)
+  );
 }
 
 function isUnknownOwner(name: string) {

@@ -25,6 +25,9 @@ interface PlaylistSortableListProps {
   displayVideos: VideoSummary[];
   sortOrder: PlaylistSortOrder;
   sortOptions: PlaylistSortOrder[];
+  /** Whether the playlist's order may be changed — true for Watch Later and the
+   * user's own playlists, false for a saved (remote) playlist that's read-only. */
+  editable: boolean;
   onSortChange: (order: PlaylistSortOrder) => void;
   onReorder: (videos: VideoSummary[]) => void;
   onPlay: (video: VideoSummary) => void;
@@ -140,12 +143,13 @@ export function PlaylistSortableList({
   displayVideos,
   sortOrder,
   sortOptions,
+  editable,
   onSortChange,
   onReorder,
   onPlay,
   onAddToQueue,
 }: PlaylistSortableListProps) {
-  const sortEnabled = sortOrder === "manual";
+  const sortEnabled = sortOrder === "manual" && editable;
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
