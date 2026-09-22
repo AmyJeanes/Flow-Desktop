@@ -183,6 +183,10 @@ export function PlaylistDetailsPage({
     }
   };
 
+  const playlistContext = meta
+    ? { id: meta.id, title: meta.title, editable, reorderable: editable && sortOrder === "manual" }
+    : null;
+
   const playQueue = (shuffle: boolean) => {
     if (displayVideos.length === 0) return;
     const queue = shuffle
@@ -190,14 +194,14 @@ export function PlaylistDetailsPage({
       : displayVideos;
     const first = queue[0];
     if (!first) return;
-    setQueue(queue, 0);
+    setQueue(queue, 0, playlistContext, shuffle ? displayVideos : null);
     navigate(`/watch/${first.id}`);
   };
 
   const playFromPlaylist = (video: VideoSummary) => {
     const startIndex = displayVideos.findIndex((item) => item.id === video.id);
     const safeIndex = startIndex >= 0 ? startIndex : 0;
-    setQueue(displayVideos, safeIndex);
+    setQueue(displayVideos, safeIndex, playlistContext);
     navigate(`/watch/${video.id}`);
   };
 
