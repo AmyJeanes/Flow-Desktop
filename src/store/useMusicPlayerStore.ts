@@ -168,6 +168,9 @@ interface MusicPlayerState {
   repeatMode: MusicRepeatMode;
   isShuffle: boolean;
   radioEnabled: boolean; // autoplay similar music when the queue runs out
+  // A station the user started by name runs until the next queue even with autoplay off.
+  // Session only: the saved setting governs queues that run out on their own.
+  radioStationActive: boolean;
 
   // --- radio / autoplay ---
   radioLoading: boolean;
@@ -232,6 +235,10 @@ interface MusicPlayerState {
   _onPlaybackError: () => void;
 }
 
+/** Whether the queue refills itself: the saved autoplay setting, or a station started by name. */
+export const selectRadioOn = (s: Pick<MusicPlayerState, "radioEnabled" | "radioStationActive">): boolean =>
+  s.radioEnabled || s.radioStationActive;
+
 export const useMusicPlayerStore = create<MusicPlayerState>((set, get) => ({
   currentTrack: null,
   queue: [],
@@ -251,6 +258,7 @@ export const useMusicPlayerStore = create<MusicPlayerState>((set, get) => ({
   repeatMode: initialConfig.repeatMode,
   isShuffle: initialConfig.isShuffle,
   radioEnabled: initialConfig.radioEnabled,
+  radioStationActive: false,
   radioLoading: false,
   radioQueuedIds: [],
 
@@ -264,21 +272,21 @@ export const useMusicPlayerStore = create<MusicPlayerState>((set, get) => ({
 
   playTrack: async (track) => {
     resetRadioSession([videoIdOf(track)]);
-    set({ queue: [track], radioQueuedIds: [] });
+    set({ queue: [track], radioQueuedIds: [], radioStationActive: false });
     await get()._loadIndex(0);
   },
 
   playQueue: async (tracks, startIndex = 0) => {
     if (tracks.length === 0) return;
     resetRadioSession(tracks.map(videoIdOf));
-    set({ queue: tracks, radioQueuedIds: [] });
+    set({ queue: tracks, radioQueuedIds: [], radioStationActive: false });
     await get()._loadIndex(Math.max(0, Math.min(startIndex, tracks.length - 1)));
   },
 
   _ensureRadio: async () => {
     if (radioInFlight) return radioInFlight;
-    const { queue, currentIndex, radioEnabled, isShuffle } = get();
-    if (!radioEnabled || isShuffle) return;
+    const { queue, currentIndex, isShuffle } = get();
+    if (!selectRadioOn(get()) || isShuffle) return;
     if (queue.length - 1 - currentIndex > RADIO_LOW_WATER) return;
 
     const seed = queue[queue.length - 1] ?? get().currentTrack;
@@ -441,6 +449,7 @@ export const useMusicPlayerStore = create<MusicPlayerState>((set, get) => ({
       currentTrack: null,
       queue: [],
       radioQueuedIds: [],
+      radioStationActive: false,
       currentIndex: -1,
       isPlaying: false,
       isBuffering: false,
@@ -504,7 +513,7 @@ export const useMusicPlayerStore = create<MusicPlayerState>((set, get) => ({
       if (nextIndex >= queue.length) {
         if (repeatMode === "all") {
           nextIndex = 0;
-        } else if (get().radioEnabled) {
+        } else if (selectRadioOn(get())) {
           void (async () => {
             await get()._ensureRadio();
             const s = get();
@@ -570,8 +579,8 @@ export const useMusicPlayerStore = create<MusicPlayerState>((set, get) => ({
   },
 
   toggleRadio: () => {
-    const radioEnabled = !get().radioEnabled;
-    set({ radioEnabled });
+    const radioEnabled = !selectRadioOn(get());
+    set({ radioEnabled, radioStationActive: false });
     saveConfig(get);
     if (radioEnabled) void get()._ensureRadio();
   },
@@ -580,8 +589,7 @@ export const useMusicPlayerStore = create<MusicPlayerState>((set, get) => ({
     const base = seed ?? get().currentTrack;
     if (!base) return;
     resetRadioSession([videoIdOf(base)]);
-    set({ queue: [base], radioQueuedIds: [], currentIndex: 0, radioEnabled: true });
-    saveConfig(get);
+    set({ queue: [base], radioQueuedIds: [], currentIndex: 0, radioStationActive: true });
     await get()._loadIndex(0);
   },
 
