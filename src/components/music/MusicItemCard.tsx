@@ -43,7 +43,6 @@ export type MusicItemCardProps = BaseProps &
     | {
         variant: 'track-list';
         item: SongItem;
-        onMenu?: () => void;
         onNavigate?: () => void;
         appendActions?: MusicMenuAction[];
       }
@@ -546,14 +545,12 @@ function CircleCard({
 function ListRow({
   item,
   onPlay,
-  onMenu,
   onNavigate,
   appendActions,
   className,
 }: {
   item: SongItem;
   onPlay?: () => void;
-  onMenu?: () => void;
   onNavigate?: () => void;
   appendActions?: MusicMenuAction[];
   className?: string;
@@ -588,10 +585,7 @@ function ListRow({
       id: 'add-to-queue',
       label: getString('music_add_to_queue'),
       icon: <ListPlus size={16} />,
-      onSelect: () => {
-        if (onMenu) onMenu();
-        else addToQueue(item);
-      },
+      onSelect: () => addToQueue(item),
     },
     {
       id: 'play-next',
@@ -831,7 +825,6 @@ export function MusicItemCard(props: MusicItemCardProps) {
         <ListRow
           item={props.item}
           onPlay={onPlay}
-          onMenu={props.onMenu}
           onNavigate={props.onNavigate}
           appendActions={props.appendActions}
           className={className}
