@@ -14,6 +14,11 @@ MUSIC
 - Fixed related songs, Daily Mixes and the Similar to shelves coming up empty after YouTube Music added a Comments tab next to Related.
 - Start a radio station from any song menu. It keeps playing for that session without changing your Autoplay setting, and switching Autoplay off stops it.
 
+PLAYLISTS
+- Playlist sorts do what they say: Date published sorts by when each video came out, and Date added follows when you actually added each video, newest or oldest first.
+- Each playlist remembers its sort, and while sorted by date added, rows show when each video was added.
+- Add times are kept from Android backups and travel with sync. Date added is only offered for playlists in your library.
+
 SUPPORTED DEVICES
 - Windows 10/11 (x64 and ARM64)
 - macOS 13+ (Intel and Apple Silicon)
