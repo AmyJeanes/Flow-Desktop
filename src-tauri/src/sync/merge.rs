@@ -318,9 +318,11 @@ fn merge_one_playlist(a: &Playlist, b: &Playlist) -> Playlist {
     for item in &b.items {
         match items.get_mut(&item.video_id) {
             Some(e) => {
+                let added_at_ms = earliest_known(e.added_at_ms, item.added_at_ms);
                 if !a_wins(e, &e.hlc, item, &item.hlc) {
                     *e = item.clone();
                 }
+                e.added_at_ms = added_at_ms;
             }
             None => {
                 items.insert(item.video_id.clone(), item.clone());
@@ -355,6 +357,17 @@ fn merge_one_playlist(a: &Playlist, b: &Playlist) -> Playlist {
         deleted: hi.deleted,
         items,
         raw: hi.raw.clone(),
+    }
+}
+
+/// An item's add time is when it first went in, on whichever device. 0 is unknown: Android sends 0
+/// for most items and re-exports them with a newer HLC, which would otherwise wipe a known time.
+/// Same rule as Android's `PlaylistMerger.earliest`.
+fn earliest_known(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, b) => b,
+        (a, 0) => a,
+        (a, b) => a.min(b),
     }
 }
 
