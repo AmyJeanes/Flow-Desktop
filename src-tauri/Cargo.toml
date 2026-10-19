@@ -97,6 +97,11 @@ windows = { version = "0.62", features = ["Win32_UI_Shell"] }
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-window-state = "2"
 
+# tauri-plugin-deep-link 2.6.2 builds `ini::ParseOption` with only the fields rust-ini 0.21.1
+# has, so 0.21.3 breaks its Linux build. Drop this pin once deep-link ships a fix.
+[target.'cfg(target_os = "linux")'.dependencies]
+rust-ini = "=0.21.1"
+
 [profile.release]
 # Keep production binaries compact without sacrificing the normal release optimizer.
 panic = "abort"
