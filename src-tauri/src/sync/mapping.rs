@@ -763,8 +763,7 @@ fn playlist_from_mirror(m: StoredPlaylistMirror, device_id: &str) -> Playlist {
                 .extra
                 .get(ADDED_AT_KEY)
                 .and_then(Value::as_u64)
-                .filter(|ms| *ms > 0)
-                .unwrap_or(created_ms),
+                .unwrap_or(0),
             deleted: false,
             title: Some(t.title.clone()),
             channel_name: Some(t.channel_name.clone()),
@@ -876,17 +875,21 @@ fn playlist_to_mirror(p: &Playlist) -> StoredPlaylistMirror {
 }
 
 fn item_to_mirror(i: &PlaylistItem) -> VideoSummaryMirror {
+    // 0 means the sender does not know when the item was added. A known time can come from the
+    // other side of a merge, so it replaces the one in `raw`.
+    let with_added_at = |mut m: VideoSummaryMirror| {
+        if i.added_at_ms > 0 {
+            m.extra
+                .insert(ADDED_AT_KEY.to_string(), Value::from(i.added_at_ms));
+        }
+        m
+    };
     if let Some(raw) = &i.raw {
         if let Ok(m) = serde_json::from_value::<VideoSummaryMirror>(raw.clone()) {
-            return m;
+            return with_added_at(m);
         }
     }
-    // 0 means the sender does not know when the item was added.
-    let mut extra = BTreeMap::new();
-    if i.added_at_ms > 0 {
-        extra.insert(ADDED_AT_KEY.to_string(), Value::from(i.added_at_ms));
-    }
-    VideoSummaryMirror {
+    with_added_at(VideoSummaryMirror {
         id: i.video_id.clone(),
         title: i.title.clone().unwrap_or_default(),
         channel_name: i.channel_name.clone().unwrap_or_default(),
@@ -894,8 +897,8 @@ fn item_to_mirror(i: &PlaylistItem) -> VideoSummaryMirror {
         thumbnail_url: i.thumbnail_url.clone(),
         duration_seconds: i.duration_seconds.map(|d| d as i64),
         is_live: None,
-        extra,
-    }
+        extra: BTreeMap::new(),
+    })
 }
 
 // ===========================================================================================
