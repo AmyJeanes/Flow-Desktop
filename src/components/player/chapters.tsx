@@ -8,6 +8,7 @@ import { parseCaptionCues, type CaptionCue } from "./SubtitleOverlay";
 import { Select } from "../ui/Select";
 import { youtubeWatchUrl } from "../../lib/youtubeUrl";
 import { copyText } from "../../lib/clipboard";
+import { getString } from "../../lib/i18n/index";
 
 interface ChaptersProps {
   chapters: VideoChapter[];
@@ -136,12 +137,12 @@ export const Chapters: React.FC<ChaptersProps> = ({
     if (await copyText(youtubeWatchUrl(videoId, chapter.startSeconds))) {
       showToast({
         variant: "success",
-        message: `Copied link at ${formatTime(chapter.startSeconds)}.`,
+        message: getString("chapter_link_copied", formatTime(chapter.startSeconds)),
       });
     } else {
       showToast({
         variant: "error",
-        message: "Could not copy chapter link.",
+        message: getString("chapter_link_copy_failed"),
       });
     }
   };

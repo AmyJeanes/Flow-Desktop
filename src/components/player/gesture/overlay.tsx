@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { usePlayerStore, type PlaybackRate } from "../../../store/usePlayerStore";
 import { copyText } from "../../../lib/clipboard";
+import { getString } from "../../../lib/i18n/index";
 import { youtubeWatchUrl } from "../../../lib/youtubeUrl";
 import { StatsForNerds } from "../StatsForNerds";
 
@@ -149,7 +150,9 @@ export const PlayerGestureOverlay: React.FC<PlayerGestureOverlayProps> = ({
     const videoId = usePlayerStore.getState().currentVideo?.id;
     if (!videoId) return;
     const copied = await copyText(youtubeWatchUrl(videoId, includeTime ? currentTime : undefined));
-    showCopied(!copied ? "Couldn't copy URL" : includeTime ? "Timed URL copied" : "Video URL copied");
+    showCopied(
+      getString(!copied ? "player_url_copy_failed" : includeTime ? "player_timed_url_copied" : "player_video_url_copied"),
+    );
   };
 
   const restorePlaybackRate = () => {
@@ -249,7 +252,7 @@ export const PlayerGestureOverlay: React.FC<PlayerGestureOverlayProps> = ({
       networkState: video?.networkState,
       resolution: video ? `${video.videoWidth}x${video.videoHeight}` : null,
     }, null, 2));
-    showCopied(copied ? "Debug info copied" : "Couldn't copy debug info");
+    showCopied(getString(copied ? "player_debug_info_copied" : "player_debug_info_copy_failed"));
   };
 
   const menuItems = [

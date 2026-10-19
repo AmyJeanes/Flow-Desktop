@@ -19,6 +19,7 @@ import { usePlayerStore } from "../../store/usePlayerStore";
 import { SETTINGS } from "../../lib/settings/schema";
 import { youtubeShortsUrl, youtubeWatchUrl } from "../../lib/youtubeUrl";
 import { copyText } from "../../lib/clipboard";
+import { getString } from "../../lib/i18n/index";
 import { setSettingValue, useAppSettingsStore } from "../../store/useAppSettingsStore";
 import {
   formatPlaybackRate,
@@ -565,7 +566,7 @@ export function ShortVideoSurface({
       resolution: video ? `${video.videoWidth}x${video.videoHeight}` : null,
       captions: captions.length,
     }, null, 2));
-    showCopied(copied ? "Debug info copied" : "Couldn't copy debug info");
+    showCopied(getString(copied ? "player_debug_info_copied" : "player_debug_info_copy_failed"));
   }, [captions.length, duration, playbackRate, progress, selectedQualityId, showCopied]);
 
   const togglePictureInPicture = useCallback(() => {
@@ -863,7 +864,7 @@ export function ShortVideoSurface({
             icon={<Link size={20} />}
             label="Copy video URL"
             onClick={() => {
-              void copyText(getCurrentUrl(false)).then((copied) => showCopied(copied ? "Video URL copied" : "Couldn't copy URL"));
+              void copyText(getCurrentUrl(false)).then((copied) => showCopied(getString(copied ? "player_video_url_copied" : "player_url_copy_failed")));
               setContextMenu(null);
             }}
           />
@@ -871,7 +872,7 @@ export function ShortVideoSurface({
             icon={<Link size={20} />}
             label="Copy video URL at current time"
             onClick={() => {
-              void copyText(getCurrentUrl(true)).then((copied) => showCopied(copied ? "Timed URL copied" : "Couldn't copy URL"));
+              void copyText(getCurrentUrl(true)).then((copied) => showCopied(getString(copied ? "player_timed_url_copied" : "player_url_copy_failed")));
               setContextMenu(null);
             }}
           />
