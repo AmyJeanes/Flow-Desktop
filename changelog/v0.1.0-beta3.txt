@@ -57,6 +57,11 @@ PLAYLISTS
 - Each playlist remembers its sort, and while sorted by date added, rows show when each video was added.
 - Add times are kept from Android backups and travel with sync. Date added is only offered for playlists in your library.
 
+UNDER THE HOOD
+- Updated Tauri to 2.12 and its plugins (updater, deep links, dialogs, notifications and others), with the app and its web side kept on matching versions.
+- Updated the database layer, sync encryption libraries, cover-art tagging and random number generation to their current major versions.
+- Updated React, the video players (dash.js and hls.js), icons, translations and the build tools to their latest compatible releases.
+
 SUPPORTED DEVICES
 - Windows 10/11 (x64 and ARM64)
 - macOS 13+ (Intel and Apple Silicon)
