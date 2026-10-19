@@ -32,6 +32,9 @@ PLAYER
 - Playback now tries the same chain of YouTube clients as Flow for Android: visionOS first, then mobile web and web through SABR streaming, then the Android VR builds, then the Android app.
 - Videos opened right after launch no longer time out on slow connections: playback requests get their own connection instead of queuing behind the home and subscription feeds.
 - Live streams no longer fail to refresh on slow connections, and a video that no longer exists now shows its own message instead of a generic error.
+- Subtitles look and behave like YouTube's: auto-generated captions roll up two lines as words are spoken, and manual captions keep all their lines.
+- Subtitles scale with the player, with a size setting from 50% to 400% in Settings, Subtitle Style or the + and - keys. Saved subtitle sizes and positions from older builds reset to the defaults.
+- Drag subtitles anywhere on the player for the current video. Clicking them still pauses, seeks or opens the menu as before.
 
 SYNC
 - Syncing with a phone works in every direction again: the desktop handles collections it doesn't know yet, like Notes on newer Android builds, files each collection by name, and no longer hangs when it scans a phone's send code.
