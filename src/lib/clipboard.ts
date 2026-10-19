@@ -14,11 +14,28 @@ export async function copyText(text: string): Promise<boolean> {
     textarea.style.position = "fixed";
     textarea.style.opacity = "0";
     document.body.appendChild(textarea);
-    textarea.select();
-    const ok = document.execCommand("copy");
-    textarea.remove();
-    return ok;
+    try {
+      textarea.select();
+      return document.execCommand("copy");
+    } finally {
+      textarea.remove();
+    }
   } catch {
     return false;
   }
+}
+
+// Opens the system share sheet where there is one, else copies the link.
+export async function shareLink(title: string, url: string): Promise<"shared" | "copied" | "failed"> {
+  if (navigator.share) {
+    try {
+      await navigator.share({ title, url });
+      return "shared";
+    } catch (error) {
+      // Closing the share sheet rejects with AbortError, which isn't a failure. Any other
+      // rejection means no sheet was shown, so copy the link instead of doing nothing.
+      if (error instanceof DOMException && error.name === "AbortError") return "shared";
+    }
+  }
+  return (await copyText(url)) ? "copied" : "failed";
 }
