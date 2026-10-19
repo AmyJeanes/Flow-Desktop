@@ -14,6 +14,8 @@ import { useLikesStore } from '../../store/useLikesStore';
 import { useUiStore } from '../../store/useUiStore';
 import { useImageFallback } from '../../lib/useImageFallback';
 import { useProxiedImageUrl } from '../../lib/useProxiedImageUrl';
+import { youtubeMusicAlbumUrl, youtubeMusicWatchUrl } from '../../lib/youtubeUrl';
+import { shareLink } from '../../lib/clipboard';
 import { ExplicitBadge } from './ExplicitBadge';
 import { PlayingWave } from './PlayingWave';
 import { MusicCardMenu, type MusicMenuAction, useMusicContextMenu } from './MusicCardMenu';
@@ -41,7 +43,6 @@ export type MusicItemCardProps = BaseProps &
     | {
         variant: 'track-list';
         item: SongItem;
-        onMenu?: () => void;
         onNavigate?: () => void;
         appendActions?: MusicMenuAction[];
       }
@@ -181,26 +182,6 @@ function onKey(handler?: () => void) {
   };
 }
 
-function trackShareUrl(track: SongItem): string {
-  return `https://music.youtube.com/watch?v=${encodeURIComponent(videoIdOf(track))}`;
-}
-
-function albumShareUrl(album: AlbumItem): string {
-  return `https://music.youtube.com/browse/${encodeURIComponent(album.browseId)}`;
-}
-
-async function shareUrl(title: string, url: string) {
-  try {
-    if (navigator.share) {
-      await navigator.share({ title, url });
-      return;
-    }
-    await navigator.clipboard?.writeText(url);
-  } catch {
-    // Share/copy can be cancelled by the user; the menu should still close.
-  }
-}
-
 // --- shared sub-components ------------------------------------------------
 
 function Artwork({
@@ -320,7 +301,7 @@ function SquareCard({
           id: 'share',
           label: getString('music_share'),
           icon: <Share2 size={16} />,
-          onSelect: () => shareUrl(item.title, trackShareUrl(item)),
+          onSelect: () => void shareLink(item.title, youtubeMusicWatchUrl(videoIdOf(item))),
         },
         ...blockActions,
       ]
@@ -362,7 +343,7 @@ function SquareCard({
             id: 'share',
             label: getString('music_share'),
             icon: <Share2 size={16} />,
-            onSelect: () => shareUrl(item.title, albumShareUrl(item)),
+            onSelect: () => void shareLink(item.title, youtubeMusicAlbumUrl(item.browseId)),
           },
         ]
       : [];
@@ -564,14 +545,12 @@ function CircleCard({
 function ListRow({
   item,
   onPlay,
-  onMenu,
   onNavigate,
   appendActions,
   className,
 }: {
   item: SongItem;
   onPlay?: () => void;
-  onMenu?: () => void;
   onNavigate?: () => void;
   appendActions?: MusicMenuAction[];
   className?: string;
@@ -606,10 +585,7 @@ function ListRow({
       id: 'add-to-queue',
       label: getString('music_add_to_queue'),
       icon: <ListPlus size={16} />,
-      onSelect: () => {
-        if (onMenu) onMenu();
-        else addToQueue(item);
-      },
+      onSelect: () => addToQueue(item),
     },
     {
       id: 'play-next',
@@ -629,7 +605,7 @@ function ListRow({
       id: 'share',
       label: getString('music_share'),
       icon: <Share2 size={16} />,
-      onSelect: () => shareUrl(title, trackShareUrl(item)),
+      onSelect: () => void shareLink(title, youtubeMusicWatchUrl(videoIdOf(item))),
     },
     ...blockActions,
     ...(appendActions ?? []),
@@ -849,7 +825,6 @@ export function MusicItemCard(props: MusicItemCardProps) {
         <ListRow
           item={props.item}
           onPlay={onPlay}
-          onMenu={props.onMenu}
           onNavigate={props.onNavigate}
           appendActions={props.appendActions}
           className={className}

@@ -13,8 +13,10 @@ import {
   Volume2,
   VolumeX,
 } from "lucide-react";
-import type { PlaybackRate } from "../../../store/usePlayerStore";
+import { usePlayerStore, type PlaybackRate } from "../../../store/usePlayerStore";
 import { copyText } from "../../../lib/clipboard";
+import { getString } from "../../../lib/i18n/index";
+import { youtubeWatchUrl } from "../../../lib/youtubeUrl";
 import { StatsForNerds } from "../StatsForNerds";
 
 export type PlayerSeekFeedback = {
@@ -144,14 +146,13 @@ export const PlayerGestureOverlay: React.FC<PlayerGestureOverlayProps> = ({
     copiedTimerRef.current = setTimeout(() => setCopiedLabel(null), 1400);
   };
 
-  const getCurrentUrl = (includeTime: boolean) => {
-    const url = new URL(window.location.href);
-    if (includeTime) {
-      url.searchParams.set("t", `${Math.max(0, Math.floor(currentTime))}`);
-    } else {
-      url.searchParams.delete("t");
-    }
-    return url.toString();
+  const copyVideoUrl = async (includeTime: boolean) => {
+    const videoId = usePlayerStore.getState().currentVideo?.id;
+    if (!videoId) return;
+    const copied = await copyText(youtubeWatchUrl(videoId, includeTime ? currentTime : undefined));
+    showCopied(
+      getString(!copied ? "player_url_copy_failed" : includeTime ? "player_timed_url_copied" : "player_video_url_copied"),
+    );
   };
 
   const restorePlaybackRate = () => {
@@ -241,7 +242,7 @@ export const PlayerGestureOverlay: React.FC<PlayerGestureOverlayProps> = ({
 
   const copyDebugInfo = async () => {
     const video = videoRef.current;
-    await copyText(JSON.stringify({
+    const copied = await copyText(JSON.stringify({
       title,
       src,
       currentTime: formatTime(currentTime),
@@ -251,7 +252,7 @@ export const PlayerGestureOverlay: React.FC<PlayerGestureOverlayProps> = ({
       networkState: video?.networkState,
       resolution: video ? `${video.videoWidth}x${video.videoHeight}` : null,
     }, null, 2));
-    showCopied("Debug info copied");
+    showCopied(getString(copied ? "player_debug_info_copied" : "player_debug_info_copy_failed"));
   };
 
   const menuItems = [
@@ -268,18 +269,12 @@ export const PlayerGestureOverlay: React.FC<PlayerGestureOverlayProps> = ({
     {
       label: "Copy video URL",
       icon: <Link size={21} />,
-      action: async () => {
-        await copyText(getCurrentUrl(false));
-        showCopied("Video URL copied");
-      },
+      action: () => copyVideoUrl(false),
     },
     {
       label: "Copy video URL at current time",
       icon: <Link size={21} />,
-      action: async () => {
-        await copyText(getCurrentUrl(true));
-        showCopied("Timed URL copied");
-      },
+      action: () => copyVideoUrl(true),
     },
     {
       label: "Copy debug info",

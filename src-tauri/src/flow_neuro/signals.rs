@@ -3,8 +3,12 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
-use crate::db::settings;
+use crate::db::{settings, watch_history};
 use crate::errors::AppResult;
+use crate::flow_neuro::display_forms::{fill_gaps, record, spellings_in};
+use crate::flow_neuro::features::{TopicReader, VideoText, document_terms, extract_features};
+use crate::flow_neuro::key_migration::{spell_from_titles, to_key_spec_2};
+use crate::flow_neuro::language::system_language;
 use crate::flow_neuro::scoring::{
     AFFINITY_INCREMENT, AFFINITY_KEEP_TOP, AFFINITY_MAX, AFFINITY_MAX_ENTRIES,
     AFFINITY_PRUNE_THRESHOLD, CHANNEL_EMA_ALPHA, CHANNEL_EMA_DECAY, CHANNEL_INFERRED_BLOCK_DAYS,
@@ -16,11 +20,12 @@ use crate::flow_neuro::scoring::{
     PERSONA_MAX_STABILITY, REJECTION_EXPIRY_DAYS, REJECTION_MEMORY_MAX, RejectionSignal,
     TOPIC_EVIDENCE_MAX_ENTRIES, TOPIC_EVIDENCE_MAX_IDS, TimeBucket, TopicEvidence, UserBrain,
     VIDEO_SUPPRESSION_DAYS, WATCH_HISTORY_MAX, WATCHED_THRESHOLD_FULL, WATCHED_THRESHOLD_SAMPLED,
-    adjust_vector, apply_anchor_decay, classify_persona, extract_features, extract_rejection_keys,
-    strip_domain_tag,
+    adjust_vector, apply_anchor_decay, classify_persona, extract_rejection_keys, strip_domain_tag,
 };
 
 pub const SHORTS_LEARNING_PENALTY: f64 = 0.40;
+/// How many recent titles spell the keys of a brain converted to key spec 2.
+pub const SPELLING_TITLES: i64 = 500;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InteractionType {
@@ -43,11 +48,12 @@ impl InteractionType {
     }
 }
 
+/// The key of a link between two topics, the way Flow for Android writes it ("a|b", in order).
 pub fn make_affinity_key(t1: &str, t2: &str) -> String {
     if t1 < t2 {
-        format!("{}:{}", t1, t2)
+        format!("{t1}|{t2}")
     } else {
-        format!("{}:{}", t2, t1)
+        format!("{t2}|{t1}")
     }
 }
 
@@ -188,8 +194,17 @@ pub async fn get_or_create_brain(pool: &SqlitePool) -> AppResult<UserBrain> {
     if let Some(json_str) = settings::get_setting(pool, "user_neuro_brain").await? {
         match serde_json::from_str::<UserBrain>(&json_str) {
             Ok(mut brain) => {
-                if brain.schema_version != crate::flow_neuro::scoring::SCHEMA_VERSION {
-                    brain.schema_version = crate::flow_neuro::scoring::SCHEMA_VERSION;
+                let mut changed =
+                    brain.schema_version != crate::flow_neuro::scoring::SCHEMA_VERSION;
+                brain.schema_version = crate::flow_neuro::scoring::SCHEMA_VERSION;
+                changed |= brain.settle_languages(&system_language());
+                if to_key_spec_2(&mut brain) {
+                    let titles = watch_history::recent_video_titles(pool, SPELLING_TITLES).await?;
+                    spell_from_titles(&mut brain, &titles);
+                    tracing::info!("[FlowNeuro] brain converted to key spec 2");
+                    changed = true;
+                }
+                if changed {
                     save_brain(pool, &brain).await?;
                 }
                 return Ok(brain);
@@ -203,7 +218,8 @@ pub async fn get_or_create_brain(pool: &SqlitePool) -> AppResult<UserBrain> {
             }
         }
     }
-    let default_brain = UserBrain::default();
+    let mut default_brain = UserBrain::default();
+    default_brain.settle_languages(&system_language());
     let json_str = serde_json::to_string(&default_brain).unwrap();
     settings::set_setting(pool, "user_neuro_brain", &json_str).await?;
     Ok(default_brain)
@@ -315,14 +331,20 @@ pub fn apply_interaction(
         total_documents: brain.idf_total_documents,
     };
 
+    let spec = brain.key_spec();
     let video_vector = extract_features(
-        title,
-        channel_name,
-        description,
-        duration_sec,
-        is_live,
-        is_short,
-        &idf_snapshot,
+        &VideoText {
+            title,
+            channel_name,
+            description,
+            duration_seconds: duration_sec,
+            is_live,
+            is_short,
+        },
+        &TopicReader {
+            spec: spec.clone(),
+            idf: &idf_snapshot,
+        },
     );
 
     let primary_topic = video_vector
@@ -347,6 +369,10 @@ pub fn apply_interaction(
 
     if is_short {
         learning_rate *= SHORTS_LEARNING_PENALTY;
+    }
+
+    if interaction_type == InteractionType::Watched && learning_rate > 0.0 {
+        brain.vote_language(title, description);
     }
 
     let topic_evidence_signal =
@@ -433,10 +459,10 @@ pub fn apply_interaction(
         }
     }
 
-    // 6. Update IDF counters on positive interaction
-    if learning_rate > 0.0 {
-        for word in video_vector.topics.keys() {
-            *brain.idf_word_frequency.entry(word.clone()).or_insert(0) += 1;
+    // 6. Document frequency counts each video once, so pair counts can say what is a phrase.
+    if learning_rate > 0.0 && brain.counted_documents.insert(video_id.to_string()) {
+        for term in document_terms(title, &video_vector, &spec) {
+            *brain.idf_word_frequency.entry(term).or_insert(0) += 1;
         }
         brain.idf_total_documents += 1;
 
@@ -609,7 +635,7 @@ pub fn apply_interaction(
                 .insert(channel_id.to_string(), (current * 0.10).max(0.01));
         }
 
-        for key in extract_rejection_keys(&video_vector) {
+        for key in extract_rejection_keys(&video_vector, &spec) {
             let existing = brain
                 .rejection_patterns
                 .get(&key)
@@ -644,6 +670,19 @@ pub fn apply_interaction(
                 brain.rejection_patterns.remove(&key);
             }
         }
+    }
+
+    if learning_rate > 0.0 {
+        let keys: Vec<String> = video_vector.topics.keys().cloned().collect();
+        let keep = |key: &str| new_global.topics.contains_key(key);
+        let from_title = record(
+            &brain.display_forms,
+            &spellings_in(title, &keys, &spec),
+            keep,
+        );
+        // Keys read from the channel name still read as written somewhere.
+        brain.display_forms =
+            fill_gaps(&from_title, &spellings_in(channel_name, &keys, &spec), keep);
     }
 
     brain.total_interactions += 1;

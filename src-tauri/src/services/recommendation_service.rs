@@ -9,6 +9,12 @@ use tracing::{debug, info};
 use crate::db::recommendations;
 use crate::errors::AppResult;
 use crate::flow_neuro::brain_store::BrainStore;
+use crate::flow_neuro::display_forms::{label, with_pick_spellings};
+use crate::flow_neuro::features::{
+    TopicReader, VideoText, extract_features, pick_keys, title_words,
+};
+use crate::flow_neuro::keyed_lists::{DISCOVERY_NOISE_WORDS, keyed_lists};
+use crate::flow_neuro::keyspec::KeySpec;
 use crate::flow_neuro::ranker;
 use crate::flow_neuro::scoring::{
     CHANNEL_SUPPRESSION_DAYS, FEED_HISTORY_EXPIRY_DAYS, FEED_HISTORY_MAX, FeedEntry, FlowPersona,
@@ -16,8 +22,8 @@ use crate::flow_neuro::scoring::{
     ONBOARDING_WARMUP_INTERACTIONS, QUERY_OVERLAP_THRESHOLD, QUERY_ROTATION_FLOOR,
     QUERY_ROTATION_RECENT_WINDOW, RECENT_QUERY_TOKENS_MAX, SESSION_TOPIC_HISTORY_MAX, ScoredVideo,
     TimeBucket, TopicEvidence, UserBrain, VIDEO_SUPPRESSION_DAYS, apply_smart_diversity,
-    channel_inferred_blocked, classify_persona, extract_features, get_topic_categories,
-    is_generic_word, is_music_track, normalize_lemma, strip_domain_tag, tokenize,
+    channel_inferred_blocked, classify_persona, get_topic_categories, is_music_track,
+    strip_domain_tag,
 };
 use crate::flow_neuro::signals::{InteractionType, apply_interaction};
 use crate::models::video::{MusicHomeChip, MusicHomeSection, VideoSummary};
@@ -156,47 +162,7 @@ impl RecommendationService {
     }
 
     fn discovery_noise_words() -> &'static [&'static str] {
-        &[
-            "prompt",
-            "prompts",
-            "prompting",
-            "use",
-            "used",
-            "using",
-            "guide",
-            "tutorial",
-            "tips",
-            "tricks",
-            "thing",
-            "things",
-            "stuff",
-            "way",
-            "ways",
-            "type",
-            "types",
-            "kind",
-            "level",
-            "sensei",
-            "guru",
-            "master",
-            "pro",
-            "official",
-            "studio",
-            "studios",
-            "media",
-            "network",
-            "viral",
-            "popular",
-            "meme",
-            "memes",
-            "tiktok",
-            "tiktoks",
-            "short",
-            "shorts",
-            "minute",
-            "minutes",
-            "now",
-        ]
+        &DISCOVERY_NOISE_WORDS
     }
 
     fn discovery_filler_words() -> &'static [&'static str] {
@@ -229,14 +195,6 @@ impl RecommendationService {
             "watch",
             "see",
             "latest",
-        ]
-    }
-
-    fn discovery_polysemous_words() -> &'static [&'static str] {
-        &[
-            "code", "design", "build", "run", "play", "model", "train", "stream", "rock", "metal",
-            "spring", "cell", "plant", "jam", "wave", "track", "scale", "craft", "mix", "beat",
-            "sound", "flow", "space", "match",
         ]
     }
 
@@ -308,6 +266,11 @@ impl RecommendationService {
         self.brain_store.flush().await
     }
 
+    /// The language the brain's keys are stemmed for, which sync advertises.
+    pub async fn key_language(&self) -> String {
+        self.brain_store.read().await.key_spec().key_language
+    }
+
     /// Reload the resident brain from the database after a sync merge wrote it directly.
     pub async fn reload_brain(&self) -> AppResult<()> {
         self.brain_store.reload().await
@@ -344,13 +307,13 @@ impl RecommendationService {
         }
     }
 
-    fn has_confirmed_topic_evidence(brain: &UserBrain, topic: &str) -> bool {
+    fn has_confirmed_topic_evidence(
+        brain: &UserBrain,
+        picks: &HashSet<String>,
+        topic: &str,
+    ) -> bool {
         let base = strip_domain_tag(topic);
-        if brain
-            .preferred_topics
-            .iter()
-            .any(|preferred| normalize_lemma(preferred) == base)
-        {
+        if picks.contains(&base) {
             return true;
         }
 
@@ -371,12 +334,14 @@ impl RecommendationService {
         )
     }
 
-    fn is_substantial_topic(topic: &str) -> bool {
+    fn is_substantial_topic(topic: &str, spec: &KeySpec) -> bool {
         let lower = topic.trim().to_lowercase();
         if lower.len() < 3 {
             return false;
         }
-        if Self::discovery_noise_words().contains(&lower.as_str()) {
+        if Self::discovery_noise_words().contains(&lower.as_str())
+            || keyed_lists(spec).is_discovery_noise(&strip_domain_tag(&lower))
+        {
             return false;
         }
         if !lower.chars().any(|c| c.is_ascii_alphabetic()) {
@@ -392,31 +357,44 @@ impl RecommendationService {
             && !base.chars().all(|c| c.is_ascii_digit())
     }
 
-    fn needs_query_enrichment(topic: &str) -> bool {
+    fn needs_query_enrichment(topic: &str, spec: &KeySpec) -> bool {
         let base = strip_domain_tag(topic);
-        Self::is_broad_singleton_query(&base)
+        Self::is_broad_singleton_query(&base, spec)
             || base.len() < 6
-            || Self::discovery_polysemous_words().contains(&base.as_str())
+            || keyed_lists(spec).is_polysemous(&base)
     }
 
-    fn is_broad_singleton_query(query: &str) -> bool {
-        let normalized = normalize_lemma(&strip_domain_tag(query).replace('_', " "));
-        !normalized.contains(' ')
-            && (is_generic_word(&normalized)
-                || Self::broad_discovery_seed_words().contains(&normalized.as_str()))
+    fn is_broad_singleton_query(query: &str, spec: &KeySpec) -> bool {
+        let base = strip_domain_tag(query);
+        let mut words = base.split_whitespace();
+        let (Some(word), None) = (words.next(), words.next()) else {
+            return false;
+        };
+        let key = spec.key_of(word);
+        keyed_lists(spec).is_generic(&key)
+            || Self::broad_discovery_seed_words()
+                .iter()
+                .any(|seed| spec.key_of(seed) == key)
+    }
+
+    /// A topic key as search text: the spelling titles use for it, never the stemmed key.
+    fn spoken(brain: &UserBrain, topic: &str) -> String {
+        label(&brain.display_forms, topic)
     }
 
     fn build_discovery_query(topic: &str, brain: &UserBrain) -> String {
+        let spec = brain.key_spec();
         let base = strip_domain_tag(topic);
-        let normalized_base = normalize_lemma(&base);
-        if !Self::needs_query_enrichment(&base) {
-            return base;
+        let normalized_base = spec.key_of(&base);
+        let spoken_base = Self::spoken(brain, &base);
+        if !Self::needs_query_enrichment(&base, &spec) {
+            return spoken_base;
         }
 
         if let Some((_, domain)) = topic.split_once(':') {
             return match Self::domain_to_query_word(domain) {
-                Some(qualifier) => format!("{} {}", base, qualifier),
-                None => format!("{} {}", base, domain),
+                Some(qualifier) => format!("{spoken_base} {qualifier}"),
+                None => format!("{spoken_base} {domain}"),
             };
         }
 
@@ -427,20 +405,20 @@ impl RecommendationService {
                 if *score <= 0.10 {
                     return None;
                 }
-                let parts: Vec<&str> = key.split([':', '|']).collect();
+                let parts: Vec<&str> = key.split('|').collect();
                 if parts.len() != 2 {
                     return None;
                 }
                 let left = strip_domain_tag(parts[0]);
                 let right = strip_domain_tag(parts[1]);
                 if left == base
-                    && Self::is_substantial_topic(&right)
-                    && !Self::is_broad_singleton_query(&right)
+                    && Self::is_substantial_topic(&right, &spec)
+                    && !Self::is_broad_singleton_query(&right, &spec)
                 {
                     Some((right, *score))
                 } else if right == base
-                    && Self::is_substantial_topic(&left)
-                    && !Self::is_broad_singleton_query(&left)
+                    && Self::is_substantial_topic(&left, &spec)
+                    && !Self::is_broad_singleton_query(&left, &spec)
                 {
                     Some((left, *score))
                 } else {
@@ -451,7 +429,7 @@ impl RecommendationService {
             .map(|(partner, _)| partner);
 
         if let Some(partner) = affinity_partner {
-            return format!("{} {}", base, partner);
+            return format!("{spoken_base} {}", Self::spoken(brain, &partner));
         }
 
         if let Some((co_topic, _)) = brain
@@ -462,8 +440,8 @@ impl RecommendationService {
                 let co_topic = strip_domain_tag(topic_name);
                 if co_topic != base
                     && *score > 0.05
-                    && Self::is_substantial_topic(&co_topic)
-                    && !Self::is_broad_singleton_query(&co_topic)
+                    && Self::is_substantial_topic(&co_topic, &spec)
+                    && !Self::is_broad_singleton_query(&co_topic, &spec)
                 {
                     Some((co_topic, *score))
                 } else {
@@ -472,7 +450,7 @@ impl RecommendationService {
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         {
-            return format!("{} {}", base, co_topic);
+            return format!("{spoken_base} {}", Self::spoken(brain, &co_topic));
         }
 
         if let Some(category_keyword) = get_topic_categories()
@@ -481,36 +459,37 @@ impl RecommendationService {
                 category
                     .keywords
                     .iter()
-                    .any(|keyword| normalize_lemma(keyword) == normalized_base)
+                    .any(|keyword| spec.key_of(keyword) == normalized_base)
             })
             .and_then(|category| {
                 category
                     .keywords
                     .iter()
                     .find(|keyword| {
-                        let lemma = normalize_lemma(keyword);
-                        lemma != normalized_base
+                        spec.key_of(keyword) != normalized_base
                             && keyword.len() > 3
-                            && !Self::is_broad_singleton_query(&lemma)
+                            && !Self::is_broad_singleton_query(keyword, &spec)
                     })
                     .cloned()
             })
         {
-            return format!("{} {}", base, category_keyword.to_lowercase());
+            return format!("{spoken_base} {}", category_keyword.to_lowercase());
         }
 
-        base
+        spoken_base
     }
 
     fn analyze_mature_topics(
         brain: &UserBrain,
         time_topic_scores: &HashMap<String, f64>,
     ) -> Vec<MatureTopic> {
+        let spec = brain.key_spec();
+        let picks = pick_keys(brain);
         let mut topic_scores: HashMap<String, (f64, f64)> = HashMap::new();
 
         for (name, score) in &brain.global_vector.topics {
             let normalized = strip_domain_tag(name);
-            if !Self::is_substantial_topic(&normalized) {
+            if !Self::is_substantial_topic(&normalized, &spec) {
                 continue;
             }
             let entry = topic_scores.entry(normalized).or_insert((0.0, 0.0));
@@ -519,7 +498,7 @@ impl RecommendationService {
 
         for (name, score) in time_topic_scores {
             let normalized = strip_domain_tag(name);
-            if !Self::is_substantial_topic(&normalized) {
+            if !Self::is_substantial_topic(&normalized, &spec) {
                 continue;
             }
             let entry = topic_scores.entry(normalized).or_insert((0.0, 0.0));
@@ -555,7 +534,7 @@ impl RecommendationService {
                         let lemmas: Vec<String> = category
                             .keywords
                             .iter()
-                            .map(|keyword| normalize_lemma(keyword))
+                            .map(|keyword| spec.key_of(keyword))
                             .collect();
                         lemmas.contains(&normalized)
                             && lemmas
@@ -572,7 +551,11 @@ impl RecommendationService {
                     maturity,
                     category_support,
                     has_time_context,
-                    has_discovery_evidence: Self::has_confirmed_topic_evidence(brain, &normalized),
+                    has_discovery_evidence: Self::has_confirmed_topic_evidence(
+                        brain,
+                        &picks,
+                        &normalized,
+                    ),
                 }
             })
             .collect();
@@ -666,14 +649,15 @@ impl RecommendationService {
     }
 
     fn top_anchor_topics(brain: &UserBrain) -> Vec<String> {
+        let spec = brain.key_spec();
+        // A pick of several words is one key now ("machin learn"), so phrases anchor too.
         let mut anchors: Vec<(String, f64, f64)> = brain
             .global_vector
             .anchor_topics
             .iter()
             .filter_map(|topic| {
                 let normalized = strip_domain_tag(topic);
-                if normalized.contains('_')
-                    || !Self::is_substantial_topic(&normalized)
+                if !Self::is_substantial_topic(&normalized, &spec)
                     || brain
                         .blocked_topics
                         .iter()
@@ -719,7 +703,7 @@ impl RecommendationService {
             .iter()
             .filter_map(|(topic, weight)| {
                 let normalized = strip_domain_tag(topic);
-                if !normalized.contains('_')
+                if !normalized.contains(' ')
                     || brain.global_vector.anchor_topics.contains(topic)
                     || *weight <= 0.0
                     || *weight > EMERGING_TOKEN_MAX_WEIGHT
@@ -761,10 +745,14 @@ impl RecommendationService {
         let mut queries = Vec::new();
         for anchor in &anchors {
             for emerging in &emerging_tokens {
-                if emerging == anchor || emerging.split('_').any(|part| part == anchor) {
+                if emerging == anchor || emerging.split(' ').any(|part| part == anchor) {
                     continue;
                 }
-                let query = format!("{} {}", anchor, emerging);
+                let query = format!(
+                    "{} {}",
+                    Self::spoken(brain, anchor),
+                    Self::spoken(brain, emerging)
+                );
                 if Self::discovery_query_blocked(&query, &brain.blocked_topics) {
                     continue;
                 }
@@ -782,13 +770,16 @@ impl RecommendationService {
         queries
     }
 
-    fn extract_query_root(query: &str) -> Option<String> {
-        let filler = Self::discovery_filler_words();
+    fn extract_query_root(query: &str, spec: &KeySpec) -> Option<String> {
+        let filler: HashSet<String> = Self::discovery_filler_words()
+            .iter()
+            .map(|word| spec.key_of(word))
+            .collect();
         let tokens: Vec<String> = query
             .split_whitespace()
             .filter(|token| token.len() > 2)
-            .map(normalize_lemma)
-            .filter(|token| !filler.contains(&token.as_str()))
+            .map(|token| spec.key_of(token))
+            .filter(|token| !filler.contains(token))
             .collect();
         if tokens.is_empty() {
             return None;
@@ -802,6 +793,7 @@ impl RecommendationService {
     fn balance_discovery_queries(
         queries: Vec<DiscoveryQuery>,
         available_topic_count: usize,
+        spec: &KeySpec,
     ) -> Vec<String> {
         let mut sorted = queries;
         sorted.sort_by(|a, b| {
@@ -813,7 +805,7 @@ impl RecommendationService {
         let mut deduped: Vec<DiscoveryQuery> = Vec::new();
         let mut seen_token_sets: Vec<HashSet<String>> = Vec::new();
         for query in sorted {
-            let tokens: HashSet<String> = tokenize(&query.query).into_iter().collect();
+            let tokens = title_words(&query.query, spec);
             let is_duplicate = seen_token_sets.iter().any(|existing| {
                 if existing.is_empty() || tokens.is_empty() {
                     return false;
@@ -857,7 +849,7 @@ impl RecommendationService {
                     .iter()
                     .any(|existing| existing.query == query.query)
                 {
-                    if let Some(root) = Self::extract_query_root(&query.query) {
+                    if let Some(root) = Self::extract_query_root(&query.query, spec) {
                         covered_roots.insert(root);
                     }
                     balanced.push(query);
@@ -876,7 +868,7 @@ impl RecommendationService {
                 .cloned()
                 .collect();
             for query in remaining {
-                if let Some(root) = Self::extract_query_root(&query.query) {
+                if let Some(root) = Self::extract_query_root(&query.query, spec) {
                     if !covered_roots.contains(&root) {
                         covered_roots.insert(root);
                         balanced.push(query);
@@ -890,7 +882,7 @@ impl RecommendationService {
 
         let mut topic_count_in_output: HashMap<String, usize> = HashMap::new();
         for query in &balanced {
-            if let Some(root) = Self::extract_query_root(&query.query) {
+            if let Some(root) = Self::extract_query_root(&query.query, spec) {
                 *topic_count_in_output.entry(root).or_insert(0) += 1;
             }
         }
@@ -903,7 +895,7 @@ impl RecommendationService {
             {
                 continue;
             }
-            let root = Self::extract_query_root(&query.query);
+            let root = Self::extract_query_root(&query.query, spec);
             if let Some(root_key) = root.clone() {
                 if topic_count_in_output.get(&root_key).copied().unwrap_or(0) >= 2 {
                     continue;
@@ -928,6 +920,7 @@ impl RecommendationService {
     fn rotate_against_recent_queries(
         queries: Vec<String>,
         recent_query_tokens: &[HashSet<String>],
+        spec: &KeySpec,
     ) -> (Vec<String>, bool) {
         if recent_query_tokens.is_empty() || queries.len() <= QUERY_ROTATION_FLOOR {
             return (queries, false);
@@ -935,7 +928,7 @@ impl RecommendationService {
 
         let (fresh, overlapping): (Vec<String>, Vec<String>) =
             queries.iter().cloned().partition(|query| {
-                let tokens: HashSet<String> = tokenize(query).into_iter().collect();
+                let tokens = title_words(query, spec);
                 if tokens.is_empty() {
                     return true;
                 }
@@ -981,6 +974,8 @@ impl RecommendationService {
 
     pub async fn generate_discovery_queries(&self) -> AppResult<Vec<String>> {
         let mut brain = self.brain_store.write().await;
+        let spec = brain.key_spec();
+        let picks = pick_keys(&brain);
         let persona = classify_persona(&brain);
         let current_bucket = TimeBucket::current();
         let current_year = chrono::Local::now().year();
@@ -993,7 +988,7 @@ impl RecommendationService {
                     .topics
                     .iter()
                     .map(|(topic, score)| (strip_domain_tag(topic), *score))
-                    .filter(|(topic, _)| Self::is_substantial_topic(topic))
+                    .filter(|(topic, _)| Self::is_substantial_topic(topic, &spec))
                     .collect();
                 topics.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 topics.into_iter().take(5).collect()
@@ -1083,8 +1078,8 @@ impl RecommendationService {
                 queries.push(DiscoveryQuery {
                     query: format!(
                         "{} {}",
-                        strip_domain_tag(&primary_topic.name),
-                        strip_domain_tag(&topic.name)
+                        Self::spoken(&brain, &primary_topic.name),
+                        Self::spoken(&brain, &topic.name)
                     ),
                     confidence: 0.60,
                     strategy: "cross_topic",
@@ -1095,8 +1090,8 @@ impl RecommendationService {
                 queries.push(DiscoveryQuery {
                     query: format!(
                         "{} {}",
-                        strip_domain_tag(&secondary[0].name),
-                        strip_domain_tag(&secondary[1].name)
+                        Self::spoken(&brain, &secondary[0].name),
+                        Self::spoken(&brain, &secondary[1].name)
                     ),
                     confidence: 0.50,
                     strategy: "cross_topic",
@@ -1118,7 +1113,10 @@ impl RecommendationService {
             };
             if let Some(format_word) = format_word {
                 queries.push(DiscoveryQuery {
-                    query: format!("{} {}", strip_domain_tag(&primary_topic.name), format_word),
+                    query: format!(
+                        "{} {format_word}",
+                        Self::spoken(&brain, &primary_topic.name)
+                    ),
                     confidence: 0.55,
                     strategy: "format_driven",
                 });
@@ -1139,7 +1137,7 @@ impl RecommendationService {
             queries.push(DiscoveryQuery {
                 query: format!(
                     "{} {}",
-                    strip_domain_tag(&secondary[0].name),
+                    Self::spoken(&brain, &secondary[0].name),
                     Self::discovery_freshness_words()[0]
                 ),
                 confidence: 0.50,
@@ -1158,16 +1156,16 @@ impl RecommendationService {
             .filter(|(_, score)| *score > 0.15)
             .take(3)
         {
-            let parts: Vec<&str> = key.split([':', '|']).collect();
+            let parts: Vec<&str> = key.split('|').collect();
             if parts.len() == 2
-                && Self::is_substantial_topic(parts[0])
-                && Self::is_substantial_topic(parts[1])
+                && Self::is_substantial_topic(parts[0], &spec)
+                && Self::is_substantial_topic(parts[1], &spec)
             {
                 queries.push(DiscoveryQuery {
                     query: format!(
                         "{} {}",
-                        strip_domain_tag(parts[0]),
-                        strip_domain_tag(parts[1])
+                        Self::spoken(&brain, parts[0]),
+                        Self::spoken(&brain, parts[1])
                     ),
                     confidence: 0.55 + (score * 0.25),
                     strategy: "cross_topic",
@@ -1190,7 +1188,11 @@ impl RecommendationService {
         }
         if confirmed_time_topics.len() >= 2 {
             queries.push(DiscoveryQuery {
-                query: format!("{} {}", confirmed_time_topics[0], confirmed_time_topics[1]),
+                query: format!(
+                    "{} {}",
+                    Self::spoken(&brain, &confirmed_time_topics[0]),
+                    Self::spoken(&brain, &confirmed_time_topics[1])
+                ),
                 confidence: 0.70,
                 strategy: "contextual",
             });
@@ -1209,8 +1211,8 @@ impl RecommendationService {
                 .iter()
                 .filter_map(|(topic, weight)| {
                     let normalized = strip_domain_tag(topic);
-                    if Self::is_substantial_topic(&normalized)
-                        && Self::has_confirmed_topic_evidence(&brain, &normalized)
+                    if Self::is_substantial_topic(&normalized, &spec)
+                        && Self::has_confirmed_topic_evidence(&brain, &picks, &normalized)
                     {
                         Some((normalized, *weight))
                     } else {
@@ -1221,7 +1223,11 @@ impl RecommendationService {
             top_topics.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             if top_topics.len() >= 2 {
                 queries.push(DiscoveryQuery {
-                    query: format!("{} {}", top_topics[0].0, top_topics[1].0),
+                    query: format!(
+                        "{} {}",
+                        Self::spoken(&brain, &top_topics[0].0),
+                        Self::spoken(&brain, &top_topics[1].0)
+                    ),
                     confidence: 0.50 + (*score * 0.15),
                     strategy: "channel_discovery",
                 });
@@ -1234,8 +1240,8 @@ impl RecommendationService {
             .flat_map(|profile| profile.iter())
             .fold(HashMap::<String, f64>::new(), |mut acc, (topic, weight)| {
                 let normalized = strip_domain_tag(topic);
-                if Self::is_substantial_topic(&normalized)
-                    && Self::has_confirmed_topic_evidence(&brain, &normalized)
+                if Self::is_substantial_topic(&normalized, &spec)
+                    && Self::has_confirmed_topic_evidence(&brain, &picks, &normalized)
                 {
                     *acc.entry(normalized).or_insert(0.0) += *weight;
                 }
@@ -1257,20 +1263,12 @@ impl RecommendationService {
             let mut underexplored: Vec<String> = get_topic_categories()
                 .iter()
                 .flat_map(|category| category.keywords.iter().take(3))
-                .map(|topic| normalize_lemma(topic))
-                .filter(|topic| {
-                    brain
-                        .global_vector
-                        .topics
-                        .get(topic)
-                        .copied()
-                        .unwrap_or(0.0)
-                        < 0.08
-                        && !brain
-                            .blocked_topics
-                            .iter()
-                            .any(|blocked| topic.contains(blocked))
+                .filter(|keyword| {
+                    spec.keys_of(keyword).iter().all(|key| {
+                        brain.global_vector.topics.get(key).copied().unwrap_or(0.0) < 0.08
+                    }) && !Self::discovery_query_blocked(keyword, &brain.blocked_topics)
                 })
+                .cloned()
                 .collect();
             underexplored.sort();
             underexplored.dedup();
@@ -1285,16 +1283,13 @@ impl RecommendationService {
 
         let existing_tokens: HashSet<String> = queries
             .iter()
-            .flat_map(|query| tokenize(&query.query))
+            .flat_map(|query| title_words(&query.query, &spec))
             .collect();
         for preferred in brain.preferred_topics.iter().take(5) {
-            let lemma = normalize_lemma(preferred);
-            if lemma.len() >= 3
-                && !existing_tokens.contains(&lemma)
-                && !brain
-                    .blocked_topics
-                    .iter()
-                    .any(|blocked| lemma.contains(blocked))
+            let words = title_words(preferred, &spec);
+            if !words.is_empty()
+                && !words.iter().all(|word| existing_tokens.contains(word))
+                && !Self::discovery_query_blocked(preferred, &brain.blocked_topics)
             {
                 queries.push(DiscoveryQuery {
                     query: Self::build_discovery_query(preferred.trim(), &brain),
@@ -1319,10 +1314,12 @@ impl RecommendationService {
                 continue;
             }
             if let Some(sanitized_query) = Self::sanitize_discovery_query(&query.query) {
-                let enriched_query = if Self::is_broad_singleton_query(&sanitized_query) {
+                let enriched_query = if Self::is_broad_singleton_query(&sanitized_query, &spec) {
                     let enriched = Self::build_discovery_query(&sanitized_query, &brain);
                     match Self::sanitize_discovery_query(&enriched) {
-                        Some(candidate) if !Self::is_broad_singleton_query(&candidate) => candidate,
+                        Some(candidate) if !Self::is_broad_singleton_query(&candidate, &spec) => {
+                            candidate
+                        }
                         _ => {
                             debug!(
                                 strategy = query.strategy,
@@ -1359,14 +1356,14 @@ impl RecommendationService {
         );
         debug!(queries = ?generated_snapshot, "[discovery] generated query detail");
 
-        let mut deduped = Self::balance_discovery_queries(sanitized, mature_topics.len());
+        let mut deduped = Self::balance_discovery_queries(sanitized, mature_topics.len(), &spec);
 
         info!(balanced = deduped.len(), "[discovery] balanced query set");
         debug!(queries = ?deduped, "[discovery] balanced query detail");
 
         let before_rotation = deduped.len();
         let (rotated, rotation_saturated) =
-            Self::rotate_against_recent_queries(deduped, &brain.recent_query_tokens);
+            Self::rotate_against_recent_queries(deduped, &brain.recent_query_tokens, &spec);
         deduped = rotated;
         if rotation_saturated {
             brain.recent_query_tokens.clear();
@@ -1381,12 +1378,14 @@ impl RecommendationService {
             debug!(rotated_queries = ?deduped, "[discovery] rotated query detail");
         }
 
-        let persisted_token_sets: Vec<Vec<String>> =
-            deduped.iter().map(|query| tokenize(query)).collect();
-        let previous_query_tokens = std::mem::take(&mut brain.recent_query_tokens);
-        brain.recent_query_tokens = deduped
+        let persisted_token_sets: Vec<HashSet<String>> = deduped
             .iter()
-            .map(|query| tokenize(query).into_iter().collect::<HashSet<String>>())
+            .map(|query| title_words(query, &spec))
+            .collect();
+        let previous_query_tokens = std::mem::take(&mut brain.recent_query_tokens);
+        brain.recent_query_tokens = persisted_token_sets
+            .iter()
+            .cloned()
             .chain(previous_query_tokens)
             .take(RECENT_QUERY_TOKENS_MAX)
             .collect();
@@ -1548,6 +1547,8 @@ impl RecommendationService {
             _ => 0.6,
         };
 
+        let spec = brain.key_spec();
+        let pick_keys = pick_keys(&brain);
         let rank_inputs = ranker::RankInputs {
             brain: &brain,
             time_context: &time_context_vec,
@@ -1563,6 +1564,8 @@ impl RecommendationService {
             session_video_count: session_vid_count,
             candidate_pool_size: candidate_count,
             exploration_scale,
+            pick_keys: &pick_keys,
+            spec: &spec,
         };
 
         let mut candidates_map: HashMap<String, VideoSummary> =
@@ -1573,13 +1576,18 @@ impl RecommendationService {
             let channel_id = video.channel_id.clone().unwrap_or_else(|| video.id.clone());
             let is_short = video.duration_seconds.unwrap_or(0) <= 60;
             let video_vector = extract_features(
-                &video.title,
-                &video.channel_name,
-                None, // Feeds don't carry descriptions
-                video.duration_seconds,
-                false,
-                is_short,
-                &idf_snapshot,
+                &VideoText {
+                    title: &video.title,
+                    channel_name: &video.channel_name,
+                    description: None, // Feeds don't carry descriptions
+                    duration_seconds: video.duration_seconds,
+                    is_live: false,
+                    is_short,
+                },
+                &TopicReader {
+                    spec: spec.clone(),
+                    idf: &idf_snapshot,
+                },
             );
 
             let candidate = ranker::Candidate {
@@ -1608,7 +1616,7 @@ impl RecommendationService {
             candidates_map.insert(video.id.clone(), video);
         }
 
-        let reranked_ids = apply_smart_diversity(scored);
+        let reranked_ids = apply_smart_diversity(scored, &spec);
 
         // Reassemble VideoSummary records in reranked order, then append any diversity drop-outs.
         let mut final_results = Vec::with_capacity(candidates_map.len());
@@ -1775,7 +1783,7 @@ impl RecommendationService {
             } else {
                 0.30
             };
-            for token in tokenize(trimmed) {
+            for token in brain.key_spec().keys_of(trimmed) {
                 brain.global_vector.topics.insert(token.clone(), weight);
                 brain
                     .global_vector
@@ -1786,6 +1794,8 @@ impl RecommendationService {
             preferred.insert(trimmed.to_string());
         }
 
+        brain.display_forms =
+            with_pick_spellings(&brain.display_forms, &preferred, &brain.key_spec());
         brain.preferred_topics = preferred;
         brain.has_completed_onboarding = true;
         Ok(())
@@ -2164,8 +2174,8 @@ impl RecommendationService {
         if normalized.is_empty() {
             return Ok(());
         }
-        let lemma = normalize_lemma(&normalized);
         let mut brain = self.brain_store.write().await;
+        let lemma = brain.key_spec().key_of(&normalized);
         brain.blocked_topics.insert(normalized.clone());
         brain
             .preferred_topics
@@ -2194,7 +2204,12 @@ impl RecommendationService {
             .blocked_topics
             .retain(|blocked| blocked.to_lowercase() != normalized);
         brain.preferred_topics.insert(trimmed.to_string());
-        for token in tokenize(trimmed) {
+        brain.display_forms = with_pick_spellings(
+            &brain.display_forms,
+            &[trimmed.to_string()],
+            &brain.key_spec(),
+        );
+        for token in brain.key_spec().keys_of(trimmed) {
             let current = *brain.global_vector.topics.get(&token).unwrap_or(&0.0);
             brain
                 .global_vector
@@ -2265,15 +2280,15 @@ mod tests {
 
         assert_eq!(
             RecommendationService::build_discovery_query("technology", &brain),
-            "technology code"
+            "Technology code"
         );
         assert_eq!(
             RecommendationService::build_discovery_query("science", &brain),
-            "science physics"
+            "Science physics"
         );
         assert_eq!(
             RecommendationService::build_discovery_query("day", &brain),
-            "day"
+            "Day"
         );
     }
 
@@ -2298,8 +2313,14 @@ mod tests {
 
     #[test]
     fn rejects_viral_and_numeric_discovery_fragments() {
-        assert!(!RecommendationService::is_substantial_topic("viral"));
-        assert!(!RecommendationService::is_substantial_topic("3.1"));
+        assert!(!RecommendationService::is_substantial_topic(
+            "viral",
+            &KeySpec::default()
+        ));
+        assert!(!RecommendationService::is_substantial_topic(
+            "3.1",
+            &KeySpec::default()
+        ));
         assert_eq!(
             RecommendationService::sanitize_discovery_query("3.1 pro"),
             None
@@ -2323,17 +2344,66 @@ mod tests {
         brain
             .global_vector
             .topics
-            .insert("roblox_thief".to_string(), 0.08);
+            .insert("roblox thief".to_string(), 0.08);
         brain
             .global_vector
             .topics
-            .insert("leg_day".to_string(), 0.12);
+            .insert("leg day".to_string(), 0.12);
 
         let queries = RecommendationService::build_query_bonding_candidates(&brain);
         let query_text: Vec<String> = queries.into_iter().map(|query| query.query).collect();
 
-        assert!(query_text.contains(&"game leg_day".to_string()));
-        assert!(query_text.contains(&"game roblox_thief".to_string()));
+        assert!(query_text.contains(&"Game Leg Day".to_string()));
+        assert!(query_text.contains(&"Game Roblox Thief".to_string()));
+    }
+
+    #[test]
+    fn search_text_is_spelled_as_titles_write_it() {
+        use crate::flow_neuro::signals::{InteractionType, apply_interaction};
+
+        let mut brain = UserBrain::default();
+        let titles = [
+            "Restoring Vintage Guitars",
+            "Vintage Guitars Restoration Tips",
+            "Restoring Vintage Amplifiers",
+        ];
+        for round in 0..4 {
+            for (index, title) in titles.iter().enumerate() {
+                apply_interaction(
+                    &mut brain,
+                    &format!("v{round}{index}"),
+                    title,
+                    "Luthier Bench",
+                    "c1",
+                    None,
+                    Some(900),
+                    false,
+                    false,
+                    InteractionType::Watched,
+                    0.9,
+                );
+            }
+        }
+        let spec = brain.key_spec();
+        let stems: Vec<String> = ["restoring", "vintage", "amplifiers", "luthier"]
+            .iter()
+            .map(|word| spec.key_of(word))
+            .filter(|key| {
+                !["restoring", "vintage", "amplifiers", "luthier"].contains(&key.as_str())
+            })
+            .collect();
+        assert!(!stems.is_empty(), "the fixture must hold stemmed keys");
+
+        let topics: Vec<String> = brain.global_vector.topics.keys().cloned().collect();
+        for topic in &topics {
+            let query = RecommendationService::build_discovery_query(topic, &brain).to_lowercase();
+            for stem in &stems {
+                assert!(
+                    !query.split(' ').any(|word| word == stem),
+                    "{query} holds the stem {stem}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2345,7 +2415,7 @@ mod tests {
         brain
             .global_vector
             .topics
-            .insert("roblox_thief".to_string(), 0.08);
+            .insert("roblox thief".to_string(), 0.08);
 
         let queries = RecommendationService::build_query_bonding_candidates(&brain);
 
@@ -2413,15 +2483,18 @@ mod tests {
     }
 
     fn token_set(text: &str) -> HashSet<String> {
-        tokenize(text).into_iter().collect()
+        title_words(text, &KeySpec::default())
     }
 
     #[test]
     fn rotation_keeps_full_set_when_memory_is_empty() {
         let queries = rotation_queries();
 
-        let (rotated, saturated) =
-            RecommendationService::rotate_against_recent_queries(queries.clone(), &[]);
+        let (rotated, saturated) = RecommendationService::rotate_against_recent_queries(
+            queries.clone(),
+            &[],
+            &KeySpec::default(),
+        );
 
         assert_eq!(rotated, queries);
         assert!(!saturated);
@@ -2432,8 +2505,11 @@ mod tests {
         let queries = rotation_queries();
         let recent = vec![token_set("rust programming tutorial")];
 
-        let (rotated, saturated) =
-            RecommendationService::rotate_against_recent_queries(queries, &recent);
+        let (rotated, saturated) = RecommendationService::rotate_against_recent_queries(
+            queries,
+            &recent,
+            &KeySpec::default(),
+        );
 
         assert!(!rotated.contains(&"rust programming tutorial".to_string()));
         assert_eq!(rotated.len(), 5);
@@ -2449,7 +2525,11 @@ mod tests {
         // Oldest set fully overlaps the first query but sits outside the comparison window.
         recent.push(token_set("rust programming tutorial"));
 
-        let (rotated, _) = RecommendationService::rotate_against_recent_queries(queries, &recent);
+        let (rotated, _) = RecommendationService::rotate_against_recent_queries(
+            queries,
+            &recent,
+            &KeySpec::default(),
+        );
 
         assert!(rotated.contains(&"rust programming tutorial".to_string()));
     }
@@ -2459,8 +2539,11 @@ mod tests {
         let queries = rotation_queries();
         let recent: Vec<HashSet<String>> = queries.iter().map(|query| token_set(query)).collect();
 
-        let (rotated, saturated) =
-            RecommendationService::rotate_against_recent_queries(queries.clone(), &recent);
+        let (rotated, saturated) = RecommendationService::rotate_against_recent_queries(
+            queries.clone(),
+            &recent,
+            &KeySpec::default(),
+        );
 
         assert_eq!(rotated.len(), QUERY_ROTATION_FLOOR);
         assert_eq!(rotated, queries[..QUERY_ROTATION_FLOOR].to_vec());
@@ -2475,8 +2558,11 @@ mod tests {
             .collect();
         let recent: Vec<HashSet<String>> = queries.iter().map(|query| token_set(query)).collect();
 
-        let (rotated, saturated) =
-            RecommendationService::rotate_against_recent_queries(queries.clone(), &recent);
+        let (rotated, saturated) = RecommendationService::rotate_against_recent_queries(
+            queries.clone(),
+            &recent,
+            &KeySpec::default(),
+        );
 
         assert_eq!(rotated, queries);
         assert!(!saturated);

@@ -24,6 +24,8 @@ MACOS
 
 INTERFACE
 - Resizing the window is smoother: video grids and the lyrics view re-measure once per frame instead of on every resize event.
+- Copying or sharing a video, Short, chapter, song or post gives a real YouTube link instead of Flow's own address, and Shorts links now include the video.
+- Share buttons open the system share sheet where there is one and copy the link where there isn't. A copy that fails now says so instead of showing "copied".
 
 PLAYER
 - Fewer "Sign in to confirm you're not a bot" errors: when YouTube asks, the player gets a fresh visitor session and tries again before moving on.
@@ -43,6 +45,17 @@ SYNC
 - Renaming a playlist no longer leaves a copy behind on the other device, and playlists with the same name on two devices are matched once and stay matched.
 - Settings sync with Flow for Android under the names it understands, and a newer change made on the desktop is no longer overwritten. The video codec preference now stays on each device.
 - Recommendation counts no longer grow on every sync, and a channel, topic or artist you unblock on the desktop stays unblocked. Counts that had already grown are corrected once.
+
+RECOMMENDATIONS
+- Topics are read from titles the way Flow for Android reads them, so "Guitars" and "guitar" are one interest and a synced profile no longer splits one word into several topics.
+- Your existing recommendation profile is converted once on the first start, keeping what it learned without counting anything twice.
+- Interests, time patterns and discovery searches show topics the way titles write them instead of as shortened word stems.
+- Flow for Android sends its recommendation profile to the desktop again. Each device only sends it to a device that reads topics in the same language.
+
+PLAYLISTS
+- Playlist sorts do what they say: Date published sorts by when each video came out, and Date added follows when you actually added each video, newest or oldest first.
+- Each playlist remembers its sort, and while sorted by date added, rows show when each video was added.
+- Add times are kept from Android backups and travel with sync. Date added is only offered for playlists in your library.
 
 SUPPORTED DEVICES
 - Windows 10/11 (x64 and ARM64)
