@@ -6,7 +6,7 @@
 //! bidirectional syncs in any order converge to a single state with no loss or double-counting.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use flow_desktop_lib::sync::canonical::{
     AffinityWire, FlowNeuroBrainSnapshot, GCounter, Hlc, Like, LikeKind, LikeState, Lww,
@@ -42,9 +42,9 @@ where
 fn hlc(r: &mut StdRng) -> Hlc {
     let devices = ["d1", "d2"];
     Hlc::new(
-        r.gen_range(0u64..5) * 100,
-        r.gen_range(0u32..3),
-        devices[r.gen_range(0..devices.len())],
+        r.random_range(0u64..5) * 100,
+        r.random_range(0u32..3),
+        devices[r.random_range(0..devices.len())],
     )
 }
 
@@ -57,19 +57,19 @@ fn watch_history_merge_obeys_crdt_laws() {
     for _ in 0..6 {
         let mut v = Vec::new();
         for id in ["v1", "v2", "v3", "v4"] {
-            if r.gen_bool(0.7) {
+            if r.random_bool(0.7) {
                 v.push(WatchHistoryRecord {
                     video_id: id.to_string(),
-                    title: format!("t{}", r.gen_range(0..3)),
+                    title: format!("t{}", r.random_range(0..3)),
                     channel_name: None,
                     channel_id: None,
-                    watched_at_ms: r.gen_range(0..1000),
-                    progress: r.gen_range(0..=10) as f32 / 10.0,
+                    watched_at_ms: r.random_range(0..1000),
+                    progress: r.random_range(0..=10) as f32 / 10.0,
                     duration_seconds: Some(200),
-                    is_music: r.gen_bool(0.5),
-                    is_short: r.gen_bool(0.3),
+                    is_music: r.random_bool(0.5),
+                    is_short: r.random_bool(0.3),
                     hlc: hlc(&mut r),
-                    deleted: r.gen_bool(0.2),
+                    deleted: r.random_bool(0.2),
                 });
             }
         }
@@ -91,12 +91,12 @@ fn likes_merge_obeys_crdt_laws() {
     for _ in 0..6 {
         let mut v = Vec::new();
         for (kind, id) in pool {
-            if r.gen_bool(0.7) {
+            if r.random_bool(0.7) {
                 v.push(Like {
                     kind,
                     id: id.to_string(),
-                    state: states[r.gen_range(0..states.len())],
-                    updated_at_ms: r.gen_range(0..1000),
+                    state: states[r.random_range(0..states.len())],
+                    updated_at_ms: r.random_range(0..1000),
                     hlc: hlc(&mut r),
                     meta: None,
                 });
@@ -114,15 +114,15 @@ fn playlists_merge_obeys_crdt_laws() {
     for _ in 0..6 {
         let mut v = Vec::new();
         for pid in ["p1", "p2"] {
-            if r.gen_bool(0.8) {
+            if r.random_bool(0.8) {
                 let mut items = Vec::new();
                 for vid in ["v1", "v2", "v3"] {
-                    if r.gen_bool(0.6) {
+                    if r.random_bool(0.6) {
                         items.push(PlaylistItem {
                             video_id: vid.to_string(),
-                            position: r.gen_range(0..100),
-                            added_at_ms: r.gen_range(0..1000),
-                            deleted: r.gen_bool(0.2),
+                            position: r.random_range(0..100),
+                            added_at_ms: r.random_range(0..1000),
+                            deleted: r.random_bool(0.2),
                             title: None,
                             channel_name: None,
                             channel_id: None,
@@ -138,15 +138,15 @@ fn playlists_merge_obeys_crdt_laws() {
                     sync_id: pid.to_string(),
                     origin: PlaylistOrigin::Local,
                     youtube_id: None,
-                    title: format!("n{}", r.gen_range(0..3)),
+                    title: format!("n{}", r.random_range(0..3)),
                     description: None,
                     thumbnail_url: None,
                     is_music: false,
                     is_user_created: true,
                     is_protected: false,
-                    created_at_ms: r.gen_range(0..1000),
+                    created_at_ms: r.random_range(0..1000),
                     updated_hlc: hlc(&mut r),
-                    deleted: r.gen_bool(0.2),
+                    deleted: r.random_bool(0.2),
                     items,
                     raw: None,
                 });
@@ -164,10 +164,10 @@ fn settings_merge_obeys_crdt_laws() {
     for _ in 0..6 {
         let mut v = Vec::new();
         for k in ["autoplay", "default_quality_wifi", "playback_speed"] {
-            if r.gen_bool(0.7) {
+            if r.random_bool(0.7) {
                 v.push(SettingEntry {
                     key: k.to_string(),
-                    value: serde_json::json!(r.gen_range(0..5)),
+                    value: serde_json::json!(r.random_range(0..5)),
                     hlc: hlc(&mut r),
                 });
             }
@@ -184,19 +184,19 @@ fn subscriptions_merge_obeys_crdt_laws() {
     for _ in 0..6 {
         let mut v = Vec::new();
         for name in ["Tech", "News"] {
-            if r.gen_bool(0.8) {
+            if r.random_bool(0.8) {
                 let mut channel_ids: Vec<String> = Vec::new();
                 for c in ["c1", "c2", "c3"] {
-                    if r.gen_bool(0.6) {
+                    if r.random_bool(0.6) {
                         channel_ids.push(c.to_string());
                     }
                 }
                 v.push(SubscriptionGroup {
                     channel_ids,
-                    deleted: r.gen_bool(0.2),
+                    deleted: r.random_bool(0.2),
                     hlc: hlc(&mut r),
                     name: name.to_string(),
-                    sort_order: r.gen_range(0..5),
+                    sort_order: r.random_range(0..5),
                 });
             }
         }
@@ -212,16 +212,16 @@ fn subscribed_channels_merge_obeys_crdt_laws() {
     for _ in 0..6 {
         let mut v = Vec::new();
         for id in ["UCa", "UCb", "UCc"] {
-            if r.gen_bool(0.75) {
+            if r.random_bool(0.75) {
                 let stamp = hlc(&mut r);
                 v.push(SubscribedChannel {
                     channel_id: id.to_string(),
-                    name: format!("name-{}", r.gen_range(0..3)),
+                    name: format!("name-{}", r.random_range(0..3)),
                     avatar_url: String::new(),
                     subscribed_at_ms: stamp.physical_ms,
-                    is_music: r.gen_bool(0.3),
+                    is_music: r.random_bool(0.3),
                     hlc: stamp,
-                    deleted: r.gen_bool(0.3),
+                    deleted: r.random_bool(0.3),
                 });
             }
         }

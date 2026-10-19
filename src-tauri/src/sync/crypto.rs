@@ -30,8 +30,8 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::TryRng;
+use rand::rngs::SysRng;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -127,7 +127,9 @@ impl DirectionKey {
 /// Generate a fresh 256-bit master secret from the OS CSPRNG.
 pub fn generate_master_secret() -> MasterSecret {
     let mut bytes = [0u8; MASTER_SECRET_LEN];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable");
     let secret = MasterSecret(bytes);
     bytes.zeroize(); // `[u8; 32]` is `Copy` — wipe the stack copy left behind.
     secret
@@ -136,7 +138,9 @@ pub fn generate_master_secret() -> MasterSecret {
 /// Generate a fresh 16-byte session id from the OS CSPRNG.
 pub fn generate_session_id() -> SessionId {
     let mut bytes = [0u8; SESSION_ID_LEN];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable");
     SessionId(bytes)
 }
 
@@ -168,9 +172,9 @@ pub fn derive_direction_keys(
 /// `mod 1_000_000`, zero-padded to 6 digits. The mask is required for byte-exact agreement with the
 /// JVM/Kotlin side (which has no unsigned 32-bit int).
 pub fn compute_sas(master: &MasterSecret, session_id: &SessionId) -> String {
-    // `Mac` and `KeyInit` both provide `new_from_slice`; qualify to the HMAC one.
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(master.as_bytes()).expect("hmac accepts any key len");
+    // aes-gcm's `KeyInit` is also in scope; qualify to the HMAC one.
+    let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(master.as_bytes())
+        .expect("hmac accepts any key len");
     mac.update(SAS_LABEL);
     mac.update(session_id.as_bytes());
     let tag = mac.finalize().into_bytes();
@@ -234,7 +238,7 @@ pub fn seal_with_nonce(
     let aad = build_aad(session_id, frame_type, seq);
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(*nonce),
             Payload {
                 msg: plaintext,
                 aad: &aad,
@@ -313,12 +317,14 @@ impl SessionCipher {
 fn seal_with(key: &DirectionKey, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = key.cipher()?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    SysRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .expect("OS CSPRNG unavailable");
+    let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad,
@@ -339,10 +345,10 @@ fn open_with(key: &DirectionKey, aad: &[u8], wire: &[u8]) -> Result<Vec<u8>, Cry
     }
     let (nonce_bytes, ciphertext) = wire.split_at(NONCE_LEN);
     let cipher = key.cipher()?;
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).expect("split_at yields NONCE_LEN bytes");
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: ciphertext,
                 aad,

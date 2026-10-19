@@ -195,12 +195,12 @@ async fn embed_poster(
             .cloned()
             .unwrap_or_else(|| Tag::new(tagged.primary_tag_type()));
         tag.remove_picture_type(PictureType::CoverFront);
-        tag.push_picture(Picture::new_unchecked(
-            PictureType::CoverFront,
-            Some(mime),
-            None,
-            bytes,
-        ));
+        tag.push_picture(
+            Picture::unchecked(bytes)
+                .pic_type(PictureType::CoverFront)
+                .mime_type(mime)
+                .build(),
+        );
         tag.save_to_path(&media_path, WriteOptions::default())
             .map_err(|error| format!("could not write cover art: {error}"))
     })

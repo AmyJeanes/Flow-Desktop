@@ -1,6 +1,6 @@
 use crate::errors::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +20,8 @@ pub struct DownloadRecord {
     pub created_at: String,
 }
 
+// Dynamic queries here only splice this constant and `?` placeholders, never input, so they
+// are safe to pass through `AssertSqlSafe`.
 const SELECT_COLUMNS: &str = "id, video_id, title, author, media_kind, file_path, thumbnail_url, duration_seconds, quality_label, file_size_bytes, collection_db_id, created_at";
 
 /// Inserts a completed download, replacing any prior entry for the same `video_id`
@@ -73,7 +75,7 @@ pub async fn downloads_for_collection(
     collection_db_id: i64,
 ) -> AppResult<Vec<DownloadRecord>> {
     let query = format!("SELECT {SELECT_COLUMNS} FROM downloads WHERE collection_db_id = ?");
-    sqlx::query_as::<_, DownloadRecord>(&query)
+    sqlx::query_as::<_, DownloadRecord>(AssertSqlSafe(query))
         .bind(collection_db_id)
         .fetch_all(pool)
         .await
@@ -82,7 +84,7 @@ pub async fn downloads_for_collection(
 
 pub async fn list_downloads(pool: &SqlitePool) -> AppResult<Vec<DownloadRecord>> {
     let query = format!("SELECT {SELECT_COLUMNS} FROM downloads ORDER BY created_at DESC, id DESC");
-    sqlx::query_as::<_, DownloadRecord>(&query)
+    sqlx::query_as::<_, DownloadRecord>(AssertSqlSafe(query))
         .fetch_all(pool)
         .await
         .map_err(AppError::from)
@@ -95,7 +97,7 @@ pub async fn download_by_video_id(
     video_id: &str,
 ) -> AppResult<Option<DownloadRecord>> {
     let query = format!("SELECT {SELECT_COLUMNS} FROM downloads WHERE video_id = ? LIMIT 1");
-    sqlx::query_as::<_, DownloadRecord>(&query)
+    sqlx::query_as::<_, DownloadRecord>(AssertSqlSafe(query))
         .bind(video_id)
         .fetch_optional(pool)
         .await
@@ -108,7 +110,7 @@ pub async fn downloads_by_ids(pool: &SqlitePool, ids: &[i64]) -> AppResult<Vec<D
     }
     let placeholders = vec!["?"; ids.len()].join(", ");
     let query = format!("SELECT {SELECT_COLUMNS} FROM downloads WHERE id IN ({placeholders})");
-    let mut statement = sqlx::query_as::<_, DownloadRecord>(&query);
+    let mut statement = sqlx::query_as::<_, DownloadRecord>(AssertSqlSafe(query));
     for id in ids {
         statement = statement.bind(id);
     }
@@ -121,7 +123,7 @@ pub async fn delete_downloads(pool: &SqlitePool, ids: &[i64]) -> AppResult<()> {
     }
     let placeholders = vec!["?"; ids.len()].join(", ");
     let query = format!("DELETE FROM downloads WHERE id IN ({placeholders})");
-    let mut statement = sqlx::query(&query);
+    let mut statement = sqlx::query(AssertSqlSafe(query));
     for id in ids {
         statement = statement.bind(id);
     }

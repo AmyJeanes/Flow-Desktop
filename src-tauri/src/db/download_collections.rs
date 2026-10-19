@@ -1,6 +1,6 @@
 use crate::errors::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 /// A downloaded playlist/album: a named folder of items tracked together so the
 /// Downloads page can show "X of N downloaded".
@@ -23,6 +23,8 @@ pub struct DownloadCollectionRecord {
     pub downloaded_count: i64,
 }
 
+// Dynamic queries here only splice this constant and `?` placeholders, never input, so they
+// are safe to pass through `AssertSqlSafe`.
 const SELECT_COLUMNS: &str =
     "id, collection_id, kind, title, author, thumbnail_url, folder_path, total_count, created_at";
 
@@ -58,7 +60,7 @@ pub async fn find_collection(
     let query = format!(
         "SELECT {SELECT_COLUMNS} FROM download_collections WHERE collection_id = ? AND kind = ? LIMIT 1"
     );
-    sqlx::query_as::<_, DownloadCollectionRecord>(&query)
+    sqlx::query_as::<_, DownloadCollectionRecord>(AssertSqlSafe(query))
         .bind(collection_id)
         .bind(kind)
         .fetch_optional(pool)
@@ -84,7 +86,7 @@ pub async fn list_collections(pool: &SqlitePool) -> AppResult<Vec<DownloadCollec
          FROM download_collections c
          ORDER BY created_at DESC, id DESC"
     );
-    sqlx::query_as::<_, DownloadCollectionRecord>(&query)
+    sqlx::query_as::<_, DownloadCollectionRecord>(AssertSqlSafe(query))
         .fetch_all(pool)
         .await
         .map_err(AppError::from)
@@ -100,7 +102,7 @@ pub async fn collections_by_ids(
     let placeholders = vec!["?"; ids.len()].join(", ");
     let query =
         format!("SELECT {SELECT_COLUMNS} FROM download_collections WHERE id IN ({placeholders})");
-    let mut statement = sqlx::query_as::<_, DownloadCollectionRecord>(&query);
+    let mut statement = sqlx::query_as::<_, DownloadCollectionRecord>(AssertSqlSafe(query));
     for id in ids {
         statement = statement.bind(id);
     }
@@ -127,7 +129,7 @@ pub async fn delete_collection_items(pool: &SqlitePool, ids: &[i64]) -> AppResul
     }
     let placeholders = vec!["?"; ids.len()].join(", ");
     let query = format!("DELETE FROM downloads WHERE collection_db_id IN ({placeholders})");
-    let mut statement = sqlx::query(&query);
+    let mut statement = sqlx::query(AssertSqlSafe(query));
     for id in ids {
         statement = statement.bind(id);
     }
@@ -141,7 +143,7 @@ pub async fn delete_collections(pool: &SqlitePool, ids: &[i64]) -> AppResult<()>
     }
     let placeholders = vec!["?"; ids.len()].join(", ");
     let query = format!("DELETE FROM download_collections WHERE id IN ({placeholders})");
-    let mut statement = sqlx::query(&query);
+    let mut statement = sqlx::query(AssertSqlSafe(query));
     for id in ids {
         statement = statement.bind(id);
     }
