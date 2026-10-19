@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invokeBackend } from "../../lib/api/errors";
 import { logToBackend } from "../../lib/diagnostics";
 import { getString } from "../../lib/i18n/index";
@@ -15,9 +15,20 @@ const CAPTION_SIZE = "[--caption-size:calc(min(100cqh,100cqw*9/16)/22.5)]";
 const UPRIGHT_TALL_CAPTION_SIZE = "[@container(aspect-ratio<10/13)]:[--caption-size:calc(100cqw/30)]";
 // A floor YouTube doesn't have: its mini player shrinks captions to 5px at 50% scale.
 const MIN_CAPTION_PX = 12;
+// The player controls' height with the title row: padding, buttons, seekbar and title.
+const CONTROLS_CLEARANCE_PX = 112;
+// How far the pointer moves before a press on the captions becomes a drag rather than a click.
+const DRAG_THRESHOLD_PX = 4;
 
 /** Fractions of the player: the captions' centre from the left, their bottom from the bottom. */
 type CaptionPosition = { x: number; y: number };
+
+type CaptionDrag = {
+  startX: number;
+  startY: number;
+  moved: boolean;
+  toPosition: (pointer: React.PointerEvent) => CaptionPosition;
+};
 
 export type CaptionCue = {
   start: number;
@@ -112,15 +123,16 @@ function cueWords(text: string, cueStart: number): CaptionWord[] | undefined {
 
 // Browsers have no API that only decodes entities. A textarea is the standard way: the parser
 // decodes entities in its content but never reads it as tags.
+let entityDecoder: HTMLTextAreaElement | null = null;
 function decodeHtmlEntities(text: string): string {
-  const textarea = document.createElement("textarea");
-  textarea.innerHTML = text;
-  return textarea.value;
+  if (!text.includes("&")) return text;
+  entityDecoder ??= document.createElement("textarea");
+  entityDecoder.innerHTML = text;
+  return entityDecoder.value;
 }
 
 function parseVttCues(vtt: string): CaptionCue[] {
-  // Tags first, so an escaped "&lt;i&gt;" stays as text.
-  return decodeHtmlEntities(stripVttTags(vtt))
+  return stripVttTags(vtt)
     .replace(/\r/g, "")
     .split("\n\n")
     .flatMap((block) => {
@@ -135,20 +147,21 @@ function parseVttCues(vtt: string): CaptionCue[] {
 
       const [end, ...settings] = endRaw.trim().split(/\s+/);
       if (!end) return [];
-      const text = lines
-        .slice(timingIndex + 1)
-        .join("\n")
-        .trim();
+      // Decoded per cue and after the tags are stripped, so an escaped "&lt;i&gt;" stays as text and
+      // an encoded blank line can't split the cue.
+      const text = decodeHtmlEntities(lines.slice(timingIndex + 1).join("\n")).trim();
 
       if (!text) return [];
       const cleanedText = cleanCueText(text.replace(WORD_TIMESTAMPS, ""));
       if (!cleanedText) return [];
 
       const start = parseVttTimestamp(startRaw);
+      const endTime = parseVttTimestamp(end);
+      if (!Number.isFinite(start) || !Number.isFinite(endTime)) return [];
       return [
         {
           start,
-          end: parseVttTimestamp(end),
+          end: endTime,
           text: cleanedText,
           align: cueAlign(settings),
           words: cueWords(text, start),
@@ -270,7 +283,9 @@ export const SubtitleOverlay: React.FC<SubtitleOverlayProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<HTMLDivElement>(null);
   const linesRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<((pointer: React.PointerEvent) => CaptionPosition) | null>(null);
+  const dragRef = useRef<CaptionDrag | null>(null);
+  const draggedRef = useRef(false);
+  const widestLineRef = useRef<{ cues: CaptionCue[]; isBold: boolean; em: number } | null>(null);
   const [dragPosition, setDragPosition] = useState<CaptionPosition | null>(null);
   const [placedPosition, setPlacedPosition] = useState<CaptionPosition | null>(null);
   const lastCueRef = useRef<CaptionCue | null>(null);
@@ -377,25 +392,34 @@ export const SubtitleOverlay: React.FC<SubtitleOverlayProps> = ({
   // YouTube gives left-aligned (rolling) captions a window as wide as the track's longest line, so the
   // text stays put as line lengths change. Sized in em, it follows the caption size.
   const startAligned = activeCue?.align === "start";
-  const hasCue = activeCue !== null;
+  const shown = activeCue !== null || trackFailed;
   useLayoutEffect(() => {
     const anchor = anchorRef.current;
     if (!anchor) return;
     anchor.style.minWidth = "";
-    const context = startAligned ? document.createElement("canvas").getContext("2d") : null;
-    if (!context) return;
-    const font = getComputedStyle(anchor);
-    context.font = `${font.fontWeight} 100px ${font.fontFamily}`;
-    const lines = captionCues.flatMap((cue) => cue.text.split("\n"));
-    const longest = Math.max(0, ...lines.map((line) => context.measureText(line).width));
+    if (!startAligned) return;
+    // Measured once per track: an auto-generated track can have thousands of lines.
+    let widest = widestLineRef.current;
+    if (widest?.cues !== captionCues || widest.isBold !== subtitleStyle.isBold) {
+      const context = document.createElement("canvas").getContext("2d");
+      if (!context) return;
+      const font = getComputedStyle(anchor);
+      context.font = `${font.fontWeight} 100px ${font.fontFamily}`;
+      let longest = 0;
+      for (const cue of captionCues) {
+        for (const line of cue.text.split("\n")) longest = Math.max(longest, context.measureText(line).width);
+      }
+      widest = { cues: captionCues, isBold: subtitleStyle.isBold, em: longest / 100 };
+      widestLineRef.current = widest;
+    }
     // 0.8em is a line's padding on both sides.
-    anchor.style.minWidth = `min(${longest / 100 + 0.8}em, calc(100cqw - 4rem))`;
-  }, [captionCues, startAligned, hasCue, subtitleStyle.isBold]);
+    anchor.style.minWidth = `min(${widest.em + 0.8}em, calc(100cqw - 4rem))`;
+  }, [captionCues, startAligned, shown, subtitleStyle.isBold]);
 
   // A cue wider or taller than the one the captions were placed with, or a smaller player, would
-  // push them past an edge, so each render nudges them back inside. It runs after the effects above
-  // so it measures the box as drawn: clipped to two lines while rolling, at its minimum width.
-  useLayoutEffect(() => {
+  // push them past an edge, so they're nudged back inside. It runs after the effects above so it
+  // measures the box as drawn: clipped to two lines while rolling, at its minimum width.
+  const keepInside = useCallback(() => {
     const anchor = anchorRef.current;
     const area = containerRef.current?.getBoundingClientRect();
     if (!anchor || !area) return;
@@ -404,7 +428,24 @@ export const SubtitleOverlay: React.FC<SubtitleOverlayProps> = ({
     const dx = Math.max(0, area.left - caption.left) + Math.min(0, area.right - caption.right);
     const dy = Math.max(0, area.top - caption.top) + Math.min(0, area.bottom - caption.bottom);
     if (dx || dy) anchor.style.translate = `${dx}px ${dy}px`;
-  });
+  }, []);
+  useLayoutEffect(keepInside, [
+    keepInside,
+    activeCue,
+    rollingOut,
+    dragPosition,
+    placedPosition,
+    shouldShowControls,
+    subtitleStyle.fontScale,
+    subtitleStyle.isBold,
+  ]);
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const observer = new ResizeObserver(keepInside);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [keepInside, shown]);
 
   if (!activeCue && !trackFailed) return null;
 
@@ -441,6 +482,7 @@ export const SubtitleOverlay: React.FC<SubtitleOverlayProps> = ({
   const lineAlign = activeCue?.align === "start" ? "flex-start" : activeCue?.align === "end" ? "flex-end" : "center";
 
   const startDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    draggedRef.current = false;
     const area = containerRef.current?.getBoundingClientRect();
     if (!area || event.button !== 0) return;
     event.preventDefault();
@@ -455,19 +497,38 @@ export const SubtitleOverlay: React.FC<SubtitleOverlayProps> = ({
       x: Math.min(1 - halfWidth, Math.max(halfWidth, (pointer.clientX - grabX - area.left) / area.width)),
       y: Math.min(1 - height, Math.max(0, (area.bottom - pointer.clientY - grabY) / area.height)),
     });
-    dragRef.current = toPosition;
-    setDragPosition(toPosition(event));
+    dragRef.current = { startX: event.clientX, startY: event.clientY, moved: false, toPosition };
   };
 
   const moveDrag = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (dragRef.current) setDragPosition(dragRef.current(event));
+    const drag = dragRef.current;
+    if (!drag) return;
+    if (!drag.moved && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < DRAG_THRESHOLD_PX) return;
+    drag.moved = true;
+    setDragPosition(drag.toPosition(event));
   };
 
   const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!dragRef.current) return;
-    setPlacedPosition(dragRef.current(event));
+    const drag = dragRef.current;
     dragRef.current = null;
+    if (!drag?.moved) return;
+    draggedRef.current = true;
+    setPlacedPosition(drag.toPosition(event));
     setDragPosition(null);
+  };
+
+  // A click that didn't move the captions is meant for the player under them: play or pause, a
+  // double click for fullscreen, the right-click menu, or a seek where they sit over the seekbar.
+  const passToPlayer = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (draggedRef.current) return;
+    const caption = event.currentTarget;
+    caption.style.pointerEvents = "none";
+    const below = document.elementFromPoint(event.clientX, event.clientY);
+    caption.style.pointerEvents = "";
+    if (!below) return;
+    const forwarded = new MouseEvent(event.type, event.nativeEvent);
+    below.dispatchEvent(forwarded);
+    if (forwarded.defaultPrevented) event.preventDefault();
   };
 
   const defaultY = subtitleStyle.bottomOffset / 100;
@@ -475,7 +536,7 @@ export const SubtitleOverlay: React.FC<SubtitleOverlayProps> = ({
   // Near the bottom, the captions lift clear of the controls while they show; dragged higher, they stay put.
   const bottom =
     shouldShowControls && !dragPosition
-      ? `max(${position.y * 100}cqh, calc(${defaultY * 100}cqh + 64px))`
+      ? `max(${position.y * 100}cqh, ${CONTROLS_CLEARANCE_PX}px)`
       : `${position.y * 100}cqh`;
 
   return (
@@ -495,6 +556,9 @@ export const SubtitleOverlay: React.FC<SubtitleOverlayProps> = ({
         onPointerMove={moveDrag}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
+        onClick={passToPlayer}
+        onDoubleClick={passToPlayer}
+        onContextMenu={passToPlayer}
       >
         {/* A box per line, as on YouTube: one inline box wrapping across lines overlaps itself and
             only pads its first and last line's outer ends. */}

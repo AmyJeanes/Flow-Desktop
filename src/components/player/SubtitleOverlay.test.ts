@@ -14,6 +14,28 @@ describe("parseCaptionCues (WebVTT)", () => {
     expect(cue?.text).toBe(`Tom & Jerry <3 "hi" it's!\u200E`);
   });
 
+  it("keeps a cue whole when it holds an encoded blank line", () => {
+    const cues = parseCaptionCues(vtt("first&#10;&#10;second"), false);
+
+    expect(cues.map((cue) => cue.text)).toEqual(["first\nsecond"]);
+  });
+
+  it("skips a cue whose timing can't be read", () => {
+    const cues = parseCaptionCues(
+      `WEBVTT
+
+00:00:aa.000 --> 00:00:02.000
+broken
+
+00:00:02.000 --> 00:00:03.000
+fine
+`,
+      false,
+    );
+
+    expect(cues.map((cue) => cue.text)).toEqual(["fine"]);
+  });
+
   it("drops styling tags but keeps escaped angle brackets as text", () => {
     const [cue] = parseCaptionCues(vtt("<c.colorE5E5E5>so</c> <i>this</i> &lt;i&gt;"), false);
 
