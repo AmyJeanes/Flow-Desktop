@@ -101,5 +101,4 @@ way `com.pot_app.pot` does on Flathub.
 ## Flathub
 
 `io.github.flow_tube.Flow-Desktop.metainfo.xml` is the AppStream listing the
-Flatpak installs. The steps for the Flathub submission are in
-[FLATHUB.md](FLATHUB.md).
+Flatpak installs.
