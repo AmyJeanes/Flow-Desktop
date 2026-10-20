@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -57,8 +57,18 @@ pub(crate) fn node_command() -> String {
     std::env::var("FLOW_NODE").unwrap_or_else(|_| "node".to_string())
 }
 
-/// Locate a bundled `sidecar/<name>` script, in dev (repo or `src-tauri`) and
-/// packaged (next to the executable or under its `resources`) layouts.
+static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record Tauri's resource directory. Linux bundles install resources under
+/// `<prefix>/lib/<productName>/`, which is not an ancestor of the executable,
+/// so the walk in [`sidecar_candidates`] alone never finds them there.
+pub(crate) fn set_resource_dir(dir: PathBuf) {
+    let _ = RESOURCE_DIR.set(dir);
+}
+
+/// Locate a bundled `sidecar/<name>` script, in packaged (Tauri resource dir,
+/// next to the executable or under its `resources`) and dev (repo or
+/// `src-tauri`) layouts.
 pub(crate) fn sidecar_script_path(name: &str, override_var: &str) -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var(override_var) {
         let path = PathBuf::from(explicit);
@@ -67,26 +77,48 @@ pub(crate) fn sidecar_script_path(name: &str, override_var: &str) -> Option<Path
         }
     }
 
-    let rel = std::path::Path::new("sidecar").join(name);
-    let mut candidates: Vec<PathBuf> =
-        vec![rel.clone(), std::path::Path::new("src-tauri").join(&rel)];
+    let cwd = std::env::current_dir().ok();
+    let exe = std::env::current_exe().ok();
+    sidecar_candidates(
+        name,
+        RESOURCE_DIR.get().map(PathBuf::as_path),
+        cwd.as_deref(),
+        exe.as_deref(),
+    )
+    .into_iter()
+    .find(|path| path.is_file())
+}
 
-    if let Ok(cwd) = std::env::current_dir() {
+fn sidecar_candidates(
+    name: &str,
+    resource_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    exe: Option<&Path>,
+) -> Vec<PathBuf> {
+    let rel = Path::new("sidecar").join(name);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(dir) = resource_dir {
+        candidates.push(dir.join(&rel));
+    }
+
+    candidates.push(rel.clone());
+    candidates.push(Path::new("src-tauri").join(&rel));
+
+    if let Some(cwd) = cwd {
         candidates.push(cwd.join(&rel));
         candidates.push(cwd.join("src-tauri").join(&rel));
     }
 
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent().map(|p| p.to_path_buf());
-        for _ in 0..5 {
-            let Some(current) = dir else { break };
-            candidates.push(current.join(&rel));
-            candidates.push(current.join("resources").join(&rel));
-            dir = current.parent().map(|p| p.to_path_buf());
-        }
+    let mut dir = exe.and_then(Path::parent);
+    for _ in 0..5 {
+        let Some(current) = dir else { break };
+        candidates.push(current.join(&rel));
+        candidates.push(current.join("resources").join(&rel));
+        dir = current.parent();
     }
 
-    candidates.into_iter().find(|path| path.is_file())
+    candidates
 }
 
 async fn run_sidecar(content_binding: &str) -> Option<MintedToken> {
@@ -202,4 +234,57 @@ pub async fn generate_po_token(content_binding: &str) -> Option<String> {
 pub async fn remint_po_token(content_binding: &str) -> Option<String> {
     token_cache().lock().await.remove(content_binding);
     generate_po_token(content_binding).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_dir_is_tried_first() {
+        let candidates = sidecar_candidates(
+            "nsig.cjs",
+            Some(Path::new("/usr/lib/Flow Beta")),
+            None,
+            Some(Path::new("/usr/bin/flow")),
+        );
+        assert_eq!(
+            candidates.first(),
+            Some(&PathBuf::from("/usr/lib/Flow Beta/sidecar/nsig.cjs"))
+        );
+    }
+
+    #[test]
+    fn flatpak_resource_dir_is_a_candidate() {
+        let candidates = sidecar_candidates(
+            "integrity.cjs",
+            Some(Path::new("/app/lib/Flow")),
+            None,
+            Some(Path::new("/app/bin/flow")),
+        );
+        assert!(candidates.contains(&PathBuf::from("/app/lib/Flow/sidecar/integrity.cjs")));
+    }
+
+    #[test]
+    fn executable_ancestors_are_still_walked() {
+        let candidates = sidecar_candidates(
+            "nsig.cjs",
+            None,
+            None,
+            Some(Path::new("C:/Program Files/Flow/flow.exe")),
+        );
+        assert!(
+            candidates.contains(
+                &Path::new("C:/Program Files/Flow")
+                    .join("sidecar")
+                    .join("nsig.cjs")
+            )
+        );
+    }
+
+    #[test]
+    fn dev_layouts_follow_the_working_directory() {
+        let candidates = sidecar_candidates("integrity.cjs", None, Some(Path::new("/repo")), None);
+        assert!(candidates.contains(&PathBuf::from("/repo/src-tauri/sidecar/integrity.cjs")));
+    }
 }
