@@ -4,10 +4,10 @@ use crate::flow_neuro::keyed_lists::keyed_lists;
 use crate::flow_neuro::keyspec::{self, KeySpec};
 use chrono::{Datelike, Local, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
 
 // --- Scoring Constants ---
 pub const SUBSCRIPTION_BOOST: f64 = 0.15;
@@ -46,8 +46,6 @@ pub const MAX_CONSECUTIVE_SKIPS: i32 = 30;
 pub const COLD_START_THRESHOLD: i32 = 30;
 pub const ONBOARDING_WARMUP_INTERACTIONS: i32 = 50;
 pub const ONBOARDING_MAX_BOOST: f64 = 0.15;
-pub const ANCHOR_DECAY_START_INTERACTIONS: i32 = 30;
-pub const ANCHOR_TOPIC_WATCH_DECAY: f64 = 0.95;
 
 #[allow(dead_code)]
 pub const ENGAGEMENT_RATE_BASELINE: f64 = 0.05;
@@ -90,6 +88,9 @@ pub const SESSION_AFFINITY_MILD_BOOST: f64 = 0.04;
 pub const AFFINITY_INCREMENT: f64 = 0.03;
 /// A watch links each pair of its strongest topics.
 pub const AFFINITY_TOP_TOPICS: usize = 3;
+/// What a strong signal plants its top topics at, so a new interest survives its first weeks.
+pub const TOPIC_ACQUISITION_FLOOR: f64 = 0.05;
+pub const TOPIC_ACQUISITION_TOP_K: usize = 3;
 pub const AFFINITY_MAX: f64 = 1.0;
 pub const AFFINITY_MAX_ENTRIES: usize = 500;
 pub const AFFINITY_KEEP_TOP: usize = 300;
@@ -175,7 +176,6 @@ pub const MAX_SUPPRESSED_CHANNELS: usize = 100;
 pub const CHANNEL_STRIKE_BLOCK_THRESHOLD: i32 = 3;
 pub const CHANNEL_STRIKE_MIN_SPREAD_MS: u64 = 86_400_000;
 pub const CHANNEL_INFERRED_BLOCK_DAYS: u64 = 60;
-pub const REJECTION_EXPIRY_DAYS: u64 = 14;
 pub const REJECTION_MEMORY_MAX: usize = 200;
 pub const REJECTION_PENALTY_1: f64 = 0.50;
 pub const REJECTION_PENALTY_2: f64 = 0.20;
@@ -286,7 +286,13 @@ impl TimeBucket {
 #[serde(default)]
 pub struct UserBrain {
     pub time_vectors: HashMap<TimeBucket, ContentVector>,
+    /// Events each time-of-day vector has learned from; device-local.
+    pub time_bucket_counts: HashMap<TimeBucket, i32>,
     pub global_vector: ContentVector,
+    /// What the viewer took to lately ([`crate::flow_neuro::vector_math::RECENT`]). Device-local.
+    pub recent_vector: ContentVector,
+    /// What the viewer takes to in Shorts, learned from Shorts at full strength.
+    pub shorts_vector: ContentVector,
     pub channel_scores: HashMap<String, f64>,
     pub topic_affinities: HashMap<String, f64>,
     pub total_interactions: i32,
@@ -321,12 +327,59 @@ pub struct UserBrain {
     pub language_votes: HashMap<String, u32>,
     /// How titles write the keys that are spelled differently from the key.
     pub display_forms: DisplayForms,
-    /// Videos already counted toward document frequency in this run of the app.
-    #[serde(skip)]
-    pub counted_documents: HashSet<String>,
+    /// Videos already counted toward document frequency, so a rewatch never counts twice.
+    pub counted_documents: CountedDocuments,
+}
+
+/// Videos counted toward document frequency, oldest first, bounded like Android's
+/// `COUNTED_DOCUMENTS_MAX`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct CountedDocuments(VecDeque<String>);
+
+impl CountedDocuments {
+    pub const MAX: usize = 500;
+
+    #[must_use]
+    pub fn contains(&self, video_id: &str) -> bool {
+        self.0.iter().any(|id| id == video_id)
+    }
+
+    /// Records `video_id`; false when it was already counted.
+    pub fn insert(&mut self, video_id: &str) -> bool {
+        if self.contains(video_id) {
+            return false;
+        }
+        self.0.push_back(video_id.to_string());
+        if self.0.len() > Self::MAX {
+            self.0.pop_front();
+        }
+        true
+    }
+}
+
+/// Events a time bucket needs before its vector weighs as much as the whole profile.
+pub const TIME_BUCKET_CONFIDENT_EVENTS: i32 = 30;
+
+/// How far a time of day's vector can be trusted, from 0 to 1.
+#[must_use]
+pub fn time_bucket_confidence(brain: &UserBrain, bucket: TimeBucket) -> f64 {
+    let events = brain.time_bucket_counts.get(&bucket).copied().unwrap_or(0);
+    (f64::from(events) / f64::from(TIME_BUCKET_CONFIDENT_EVENTS)).clamp(0.0, 1.0)
 }
 
 impl UserBrain {
+    /// The long-term topics strong enough to be interests. Weaker ones are traces of evidence
+    /// still adding up: ranking reads them, but nothing searches for, groups or lists a topic from
+    /// one half-watched video (Android `UserBrain.interests`).
+    pub fn interests(&self) -> impl Iterator<Item = (&String, f64)> {
+        self.global_vector
+            .topics
+            .iter()
+            .filter(|(_, weight)| **weight >= TOPIC_PRUNE_THRESHOLD)
+            .map(|(key, weight)| (key, *weight))
+    }
+
     /// A fresh brain that still carries every block and "not interested" mark of this one.
     #[must_use]
     pub fn keeping_hidden_content(&self) -> Self {
@@ -348,7 +401,10 @@ impl Default for UserBrain {
         }
         Self {
             time_vectors,
+            time_bucket_counts: HashMap::new(),
             global_vector: ContentVector::default(),
+            recent_vector: ContentVector::default(),
+            shorts_vector: ContentVector::default(),
             channel_scores: HashMap::new(),
             topic_affinities: HashMap::new(),
             total_interactions: 0,
@@ -377,7 +433,7 @@ impl Default for UserBrain {
             key_spec: keyspec::VERSION,
             language_votes: HashMap::new(),
             display_forms: DisplayForms::new(),
-            counted_documents: HashSet::new(),
+            counted_documents: CountedDocuments::default(),
         }
     }
 }
@@ -730,65 +786,6 @@ pub fn get_topic_categories() -> &'static Vec<TopicCategory> {
     })
 }
 
-pub fn extract_rejection_keys(video_vector: &ContentVector, spec: &KeySpec) -> Vec<String> {
-    let lists = keyed_lists(spec);
-    let mut top_topics: Vec<(String, f64)> = video_vector
-        .topics
-        .iter()
-        .filter(|(topic, _)| strip_domain_tag(topic).len() >= 3)
-        .map(|(topic, score)| (strip_domain_tag(topic), *score))
-        .collect();
-    top_topics.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let top_topics: Vec<String> = top_topics
-        .into_iter()
-        .map(|(topic, _)| topic)
-        .take(3)
-        .collect();
-
-    if top_topics.is_empty() {
-        return Vec::new();
-    }
-
-    let mut keys = Vec::new();
-    if let Some(primary) = top_topics.iter().find(|topic| !lists.is_broad_topic(topic)) {
-        keys.push(primary.clone());
-    }
-    if top_topics.len() >= 2 {
-        let mut pair = [top_topics[0].clone(), top_topics[1].clone()];
-        pair.sort();
-        keys.push(format!("{}|{}", pair[0], pair[1]));
-    }
-    keys
-}
-
-pub fn calculate_rejection_pattern_penalty(
-    video_vector: &ContentVector,
-    rejection_patterns: &HashMap<String, RejectionSignal>,
-    now_ms: u64,
-    spec: &KeySpec,
-) -> f64 {
-    if rejection_patterns.is_empty() {
-        return 1.0;
-    }
-
-    let expiry_ms = REJECTION_EXPIRY_DAYS * 86_400_000;
-    let mut max_count = 0;
-    for key in extract_rejection_keys(video_vector, spec) {
-        if let Some(signal) = rejection_patterns.get(&key) {
-            if now_ms.saturating_sub(signal.last_rejected_at) < expiry_ms {
-                max_count = max_count.max(signal.count);
-            }
-        }
-    }
-
-    match max_count {
-        count if count >= 3 => REJECTION_PENALTY_3_PLUS,
-        2 => REJECTION_PENALTY_2,
-        1 => REJECTION_PENALTY_1,
-        _ => 1.0,
-    }
-}
-
 pub fn calculate_feed_history_penalty(
     video_id: &str,
     feed_history: &HashMap<String, FeedEntry>,
@@ -937,6 +934,7 @@ pub fn strip_domain_tag(topic: &str) -> String {
 
 // --- IDF Helpers ---
 
+#[derive(Default)]
 pub struct IdfSnapshot {
     pub word_frequencies: HashMap<String, i32>,
     pub total_documents: i32,
@@ -1039,114 +1037,6 @@ pub fn calculate_cosine_similarity(user: &ContentVector, content: &ContentVector
 }
 
 // --- Vector Adjustment ---
-
-pub fn adjust_vector(
-    current: &ContentVector,
-    target: &ContentVector,
-    base_rate: f64,
-) -> ContentVector {
-    let mut new_topics = current.topics.clone();
-    let mut new_confidence = current.topic_confidence.clone();
-    let is_negative = base_rate < 0.0;
-
-    for (key, &target_val) in &target.topics {
-        let current_val = *new_topics.get(key).unwrap_or(&0.0);
-        let delta = if is_negative {
-            let proportional =
-                current_val * current_val.powf(NEGATIVE_PROPORTIONAL_EXPONENT) * base_rate;
-            let absolute_floor = base_rate * NEGATIVE_FLOOR_FACTOR;
-            proportional.min(absolute_floor)
-        } else {
-            let saturation_penalty = (1.0 - current_val).powi(2);
-            let cold_topic_damping = 0.5 + 0.5 * (current_val / 0.20).min(1.0);
-            let effective_rate = base_rate * saturation_penalty * cold_topic_damping;
-            (target_val - current_val) * effective_rate
-        };
-        new_topics.insert(key.clone(), (current_val + delta).clamp(0.0, 1.0));
-        new_confidence.entry(key.clone()).or_insert(0.5);
-    }
-
-    if base_rate > 0.0 {
-        for (key, val) in new_topics.iter_mut() {
-            if !target.topics.contains_key(key) {
-                let tiered_decay = if *val >= ESTABLISHED_TOPIC_THRESHOLD {
-                    ESTABLISHED_DECAY_RATE
-                } else if *val >= DEVELOPING_TOPIC_THRESHOLD {
-                    DEVELOPING_DECAY_RATE
-                } else {
-                    EMERGING_DECAY_RATE
-                };
-                *val *= tiered_decay;
-            }
-        }
-    }
-
-    new_topics.retain(|key, val| {
-        let is_current_target = target.topics.contains_key(key);
-        if !is_current_target && *val < TOPIC_PRUNE_THRESHOLD {
-            new_confidence.remove(key);
-            false
-        } else {
-            true
-        }
-    });
-
-    if is_negative && !new_topics.is_empty() {
-        let total_magnitude: f64 = new_topics.values().sum();
-        let max_score = new_topics.values().cloned().fold(0.0, f64::max);
-
-        if total_magnitude > 0.0 && max_score / total_magnitude > COMPRESSION_THRESHOLD {
-            for val in new_topics.values_mut() {
-                if *val > COMPRESSION_CEILING {
-                    *val = COMPRESSION_CEILING + (*val - COMPRESSION_CEILING) * COMPRESSION_FACTOR;
-                }
-            }
-        }
-    }
-
-    let update_scalar = |curr: f64, targ: f64| -> f64 {
-        if is_negative {
-            let proportional = curr * base_rate * NEGATIVE_SCALAR_PROPORTIONAL;
-            let floor = base_rate * NEGATIVE_SCALAR_FLOOR;
-            (curr + proportional.min(floor)).clamp(0.0, 1.0)
-        } else {
-            let saturation = (1.0 - curr).powi(2);
-            (curr + (targ - curr) * base_rate * saturation).clamp(0.0, 1.0)
-        }
-    };
-
-    ContentVector {
-        topics: new_topics,
-        topic_confidence: new_confidence,
-        anchor_topics: current.anchor_topics.clone(),
-        duration: update_scalar(current.duration, target.duration),
-        pacing: update_scalar(current.pacing, target.pacing),
-        complexity: update_scalar(current.complexity, target.complexity),
-        is_live: update_scalar(current.is_live, target.is_live),
-    }
-}
-
-pub fn apply_anchor_decay(vector: &mut ContentVector, total_interactions_after_watch: i32) {
-    if total_interactions_after_watch <= ANCHOR_DECAY_START_INTERACTIONS {
-        return;
-    }
-
-    let anchor_topics: Vec<String> = vector.anchor_topics.iter().cloned().collect();
-    for topic in anchor_topics {
-        let Some(value) = vector.topics.get_mut(&topic) else {
-            vector.anchor_topics.remove(&topic);
-            vector.topic_confidence.remove(&topic);
-            continue;
-        };
-
-        *value *= ANCHOR_TOPIC_WATCH_DECAY;
-        if *value < TOPIC_PRUNE_THRESHOLD {
-            vector.topics.remove(&topic);
-            vector.topic_confidence.remove(&topic);
-            vector.anchor_topics.remove(&topic);
-        }
-    }
-}
 
 pub fn calculate_anti_recommendation_penalty(
     video_vector: &ContentVector,
@@ -1597,7 +1487,12 @@ mod tests {
         target.topics.insert("other".to_string(), 1.0);
 
         // Positive update that reinforces neither existing topic → both decay by their tier.
-        let out = adjust_vector(&current, &target, 0.1);
+        let out = crate::flow_neuro::vector_math::adjust_vector(
+            &current,
+            &target,
+            0.1,
+            TOPIC_PRUNE_THRESHOLD,
+        );
         let established_ratio = out.topics["established"] / 0.5;
         let emerging_ratio = out.topics["emerging"] / 0.05;
         assert!(established_ratio > emerging_ratio);
@@ -1626,45 +1521,6 @@ mod tests {
     }
 
     #[test]
-    fn anchor_decay_waits_until_after_warmup_threshold() {
-        let mut vector = ContentVector::default();
-        vector.topics.insert("game".to_string(), 0.75);
-        vector.topic_confidence.insert("game".to_string(), 1.0);
-        vector.anchor_topics.insert("game".to_string());
-
-        apply_anchor_decay(&mut vector, ANCHOR_DECAY_START_INTERACTIONS);
-
-        assert_eq!(vector.topics.get("game").copied(), Some(0.75));
-        assert!(vector.anchor_topics.contains("game"));
-    }
-
-    #[test]
-    fn anchor_decay_reduces_anchor_weights_and_prunes_metadata() {
-        let mut vector = ContentVector::default();
-        vector.topics.insert("game".to_string(), 0.75);
-        vector.topics.insert("roblox thief".to_string(), 0.20);
-        vector.topic_confidence.insert("game".to_string(), 1.0);
-        vector.anchor_topics.insert("game".to_string());
-
-        apply_anchor_decay(&mut vector, ANCHOR_DECAY_START_INTERACTIONS + 1);
-
-        assert_eq!(
-            vector.topics.get("game").copied(),
-            Some(0.75 * ANCHOR_TOPIC_WATCH_DECAY)
-        );
-        assert_eq!(vector.topics.get("roblox thief").copied(), Some(0.20));
-
-        for _ in 0..80 {
-            apply_anchor_decay(&mut vector, ANCHOR_DECAY_START_INTERACTIONS + 2);
-        }
-
-        assert!(!vector.topics.contains_key("game"));
-        assert!(!vector.topic_confidence.contains_key("game"));
-        assert!(!vector.anchor_topics.contains("game"));
-        assert_eq!(vector.topics.get("roblox thief").copied(), Some(0.20));
-    }
-
-    #[test]
     fn old_brain_json_without_topic_metadata_still_deserializes() {
         let raw = serde_json::json!({
             "global_vector": {
@@ -1689,8 +1545,10 @@ mod tests {
 
     #[test]
     fn a_reset_keeps_only_what_the_viewer_hid() {
-        let mut brain = UserBrain::default();
-        brain.total_interactions = 40;
+        let mut brain = UserBrain {
+            total_interactions: 40,
+            ..UserBrain::default()
+        };
         brain.global_vector.topics.insert("rust".into(), 0.7);
         brain.preferred_topics.insert("Rust".into());
         brain.blocked_channels.insert("UCx".into());
@@ -1705,5 +1563,23 @@ mod tests {
         assert!(fresh.blocked_topics.contains("drama"));
         assert!(fresh.suppressed_video_ids.contains_key("v1"));
         assert!(fresh.suppressed_channels.contains_key("UCy"));
+    }
+
+    #[test]
+    fn counted_documents_are_saved_and_keep_the_newest_five_hundred() {
+        let mut counted = CountedDocuments::default();
+        assert!(counted.insert("v0"));
+        assert!(!counted.insert("v0"));
+        for i in 1..=CountedDocuments::MAX {
+            counted.insert(&format!("v{i}"));
+        }
+        assert!(!counted.contains("v0"));
+        assert!(counted.contains(&format!("v{}", CountedDocuments::MAX)));
+
+        let mut brain = UserBrain::default();
+        brain.counted_documents.insert("seen");
+        let restored: UserBrain =
+            serde_json::from_str(&serde_json::to_string(&brain).unwrap()).unwrap();
+        assert!(restored.counted_documents.contains("seen"));
     }
 }

@@ -12,13 +12,17 @@ use crate::flow_neuro::bootstrap::{
     ImportedVideo, bootstrap_from_history, bootstrap_from_subscriptions,
 };
 use crate::flow_neuro::brain_store::BrainStore;
+use crate::flow_neuro::channel_knowledge::{learn_from_uploads, subscription_changed};
+use crate::flow_neuro::deep_flow::learning_paused;
 use crate::flow_neuro::display_forms::{label, with_pick_spellings};
 use crate::flow_neuro::features::{
     TopicReader, VideoText, extract_features, pick_keys, title_words,
 };
 use crate::flow_neuro::keyed_lists::{DISCOVERY_NOISE_WORDS, keyed_lists};
 use crate::flow_neuro::keyspec::KeySpec;
+use crate::flow_neuro::keyspec::text::is_topic_sized;
 use crate::flow_neuro::language::system_language;
+use crate::flow_neuro::learning::{Interaction, apply_interaction};
 use crate::flow_neuro::ranker;
 use crate::flow_neuro::scoring::{
     CHANNEL_SUPPRESSION_DAYS, FEED_HISTORY_EXPIRY_DAYS, FEED_HISTORY_MAX, FeedEntry, FlowPersona,
@@ -27,8 +31,12 @@ use crate::flow_neuro::scoring::{
     QUERY_ROTATION_RECENT_WINDOW, RECENT_QUERY_TOKENS_MAX, SESSION_TOPIC_HISTORY_MAX, ScoredVideo,
     TimeBucket, TopicEvidence, UserBrain, apply_smart_diversity, channel_inferred_blocked,
     classify_persona, get_topic_categories, is_known_short, is_music_track, strip_domain_tag,
+    time_bucket_confidence,
 };
-use crate::flow_neuro::signals::{InteractionType, apply_interaction};
+use crate::flow_neuro::search_learning::learn_search;
+use crate::flow_neuro::signals::InteractionType;
+use crate::flow_neuro::specificity::specificity;
+use crate::flow_neuro::vector_math::{RECENT_SHARE, blend};
 use crate::flow_neuro::watch_session::{WatchReport, WatchSession};
 use crate::models::video::{MusicHomeChip, MusicHomeSection, VideoSummary};
 use crate::services::youtube_service::YoutubeService;
@@ -41,6 +49,11 @@ const QUERY_BONDING_ANCHOR_LIMIT: usize = 4;
 const QUERY_BONDING_EMERGING_LIMIT: usize = 6;
 const QUERY_BONDING_QUERY_LIMIT: usize = 8;
 const EMERGING_TOKEN_MAX_WEIGHT: f64 = 0.18;
+/// A word every subject uses ("normal", "better") searches up any subject (Android #907).
+const QUERY_MIN_SPECIFICITY: f64 = 0.65;
+/// How much of a candidate's base score is taste (long-term, recent and time of day).
+const TASTE_WEIGHT: f64 = 0.8;
+const NOVELTY_WEIGHT: f64 = 0.2;
 
 pub struct RecommendationService {
     pool: SqlitePool,
@@ -49,6 +62,8 @@ pub struct RecommendationService {
     session_topic_history: Mutex<Vec<String>>,
     session_video_count: Mutex<i32>,
     watch: Mutex<WatchSlot>,
+    /// Channels whose upload titles were already read this session.
+    profiled_channels: Mutex<HashSet<String>>,
     #[allow(dead_code)]
     session_start_time: u64,
 }
@@ -269,6 +284,7 @@ impl RecommendationService {
             session_topic_history: Mutex::new(Vec::new()),
             session_video_count: Mutex::new(0),
             watch: Mutex::new(WatchSlot::default()),
+            profiled_channels: Mutex::new(HashSet::new()),
             session_start_time: now,
         }
     }
@@ -286,6 +302,13 @@ impl RecommendationService {
     /// Reload the resident brain from the database after a sync merge wrote it directly.
     pub async fn reload_brain(&self) -> AppResult<()> {
         self.brain_store.reload().await
+    }
+
+    /// Deep Flow keeps a session out of the profile: nothing learns while it runs.
+    async fn learning_paused(&self) -> bool {
+        learning_paused(&self.pool, self.get_current_time_ms())
+            .await
+            .unwrap_or(false)
     }
 
     fn get_current_time_ms(&self) -> u64 {
@@ -346,27 +369,30 @@ impl RecommendationService {
         )
     }
 
+    /// A topic worth a search of its own: sized like a topic in any script, not filler, a year
+    /// or a number, and specific enough that searching it does not bring up any subject (#907).
     fn is_substantial_topic(topic: &str, spec: &KeySpec) -> bool {
+        if !is_topic_sized(topic) {
+            return false;
+        }
         let lower = topic.trim().to_lowercase();
-        if lower.len() < 3 {
-            return false;
-        }
-        if Self::discovery_noise_words().contains(&lower.as_str())
-            || keyed_lists(spec).is_discovery_noise(&strip_domain_tag(&lower))
-        {
-            return false;
-        }
-        if !lower.chars().any(|c| c.is_ascii_alphabetic()) {
-            return false;
-        }
-        if lower.starts_with("20") && lower.len() == 4 && lower.chars().all(|c| c.is_ascii_digit())
-        {
-            return false;
-        }
         let base = strip_domain_tag(&lower);
-        base.len() >= 3
-            && base.chars().any(|c| c.is_ascii_alphabetic())
-            && !base.chars().all(|c| c.is_ascii_digit())
+        if Self::discovery_noise_words().contains(&lower.as_str())
+            || keyed_lists(spec).is_discovery_noise(&base)
+        {
+            return false;
+        }
+        // Unicode letters, so Arabic, Cyrillic, CJK and Thai topics qualify and "3.1" does not.
+        if !lower.chars().any(char::is_alphabetic) {
+            return false;
+        }
+        let is_year = lower.len() == 4
+            && (lower.starts_with("19") || lower.starts_with("20"))
+            && lower.chars().all(|c| c.is_ascii_digit());
+        if is_year || lower.chars().all(char::is_numeric) || !is_topic_sized(&base) {
+            return false;
+        }
+        specificity(spec).of(&lower) >= QUERY_MIN_SPECIFICITY
     }
 
     fn needs_query_enrichment(topic: &str, spec: &KeySpec) -> bool {
@@ -499,13 +525,13 @@ impl RecommendationService {
         let picks = pick_keys(brain);
         let mut topic_scores: HashMap<String, (f64, f64)> = HashMap::new();
 
-        for (name, score) in &brain.global_vector.topics {
+        for (name, score) in brain.interests() {
             let normalized = strip_domain_tag(name);
             if !Self::is_substantial_topic(&normalized, &spec) {
                 continue;
             }
             let entry = topic_scores.entry(normalized).or_insert((0.0, 0.0));
-            entry.0 = entry.0.max(*score);
+            entry.0 = entry.0.max(score);
         }
 
         for (name, score) in time_topic_scores {
@@ -662,13 +688,12 @@ impl RecommendationService {
 
     fn top_anchor_topics(brain: &UserBrain) -> Vec<String> {
         let spec = brain.key_spec();
-        // A pick of several words is one key now ("machin learn"), so phrases anchor too.
-        let mut anchors: Vec<(String, f64, f64)> = brain
-            .global_vector
-            .anchor_topics
-            .iter()
+        // The viewer's picks anchor a young profile; a pick of several words is one key
+        // ("machin learn"), so phrases anchor too.
+        let mut anchors: Vec<(String, f64)> = pick_keys(brain)
+            .into_iter()
             .filter_map(|topic| {
-                let normalized = strip_domain_tag(topic);
+                let normalized = strip_domain_tag(&topic);
                 if !Self::is_substantial_topic(&normalized, &spec)
                     || brain
                         .blocked_topics
@@ -677,48 +702,34 @@ impl RecommendationService {
                 {
                     return None;
                 }
-
                 let weight = brain
                     .global_vector
                     .topics
-                    .get(topic)
+                    .get(&topic)
                     .copied()
                     .unwrap_or(0.0);
-                let confidence = brain
-                    .global_vector
-                    .topic_confidence
-                    .get(topic)
-                    .copied()
-                    .unwrap_or(0.0);
-                Some((normalized, weight, confidence))
+                Some((normalized, weight))
             })
             .collect();
 
-        anchors.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        anchors.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         anchors.dedup_by(|a, b| a.0 == b.0);
         anchors
             .into_iter()
             .take(QUERY_BONDING_ANCHOR_LIMIT)
-            .map(|(topic, _, _)| topic)
+            .map(|(topic, _)| topic)
             .collect()
     }
 
     fn emerging_specific_tokens(brain: &UserBrain) -> Vec<String> {
+        let picks = pick_keys(brain);
         let mut tokens: Vec<(String, f64)> = brain
-            .global_vector
-            .topics
-            .iter()
+            .interests()
             .filter_map(|(topic, weight)| {
                 let normalized = strip_domain_tag(topic);
                 if !normalized.contains(' ')
-                    || brain.global_vector.anchor_topics.contains(topic)
-                    || *weight <= 0.0
-                    || *weight > EMERGING_TOKEN_MAX_WEIGHT
+                    || picks.contains(topic)
+                    || weight > EMERGING_TOKEN_MAX_WEIGHT
                     || brain
                         .blocked_topics
                         .iter()
@@ -726,7 +737,7 @@ impl RecommendationService {
                 {
                     return None;
                 }
-                Some((normalized, *weight))
+                Some((normalized, weight))
             })
             .collect();
 
@@ -1521,11 +1532,11 @@ impl RecommendationService {
             .cloned()
             .unwrap_or_default();
 
-        // Boredom detection & dynamic temperatures
-        let boredom_factor = (brain.consecutive_skips as f64 / 20.0).clamp(0.0, 0.5);
-        let w_personality = 0.4 - (boredom_factor * 0.5);
-        let w_context = 0.4 - (boredom_factor * 0.5);
-        let w_novelty = 0.2 + boredom_factor;
+        // A time of day counts for up to half the taste once it has seen enough events; skipping
+        // never reweights scoring, where it once lifted less relevant videos (Android #907).
+        let w_context = TASTE_WEIGHT * 0.5 * time_bucket_confidence(&brain, current_bucket);
+        let w_personality = TASTE_WEIGHT - w_context;
+        let w_novelty = NOVELTY_WEIGHT;
 
         let is_onboarding = brain.total_interactions < ONBOARDING_WARMUP_INTERACTIONS;
         let onboarding_warmup = if is_onboarding {
@@ -1555,8 +1566,10 @@ impl RecommendationService {
 
         let spec = brain.key_spec();
         let pick_keys = pick_keys(&brain);
+        let taste = blend(&brain.global_vector, &brain.recent_vector, RECENT_SHARE);
         let rank_inputs = ranker::RankInputs {
             brain: &brain,
+            taste: &taste,
             time_context: &time_context_vec,
             weights: ranker::ScoringWeights {
                 personality: w_personality,
@@ -1648,23 +1661,40 @@ impl RecommendationService {
         interaction_type: InteractionType,
         percent_watched: f32,
     ) -> AppResult<()> {
+        if self.learning_paused().await {
+            return Ok(());
+        }
         let channel_id = channel_id.trim().trim_start_matches("channel:");
+        let now_ms = self.get_current_time_ms();
+        #[allow(clippy::cast_precision_loss)]
+        let seconds_since_impression = self
+            .impression_cache
+            .lock()
+            .unwrap()
+            .get(video_id)
+            .map(|(_, shown_at)| now_ms.saturating_sub(*shown_at) as f64 / 1000.0);
         let outcome = {
             let mut brain = self.brain_store.write().await;
             apply_interaction(
                 &mut brain,
-                video_id,
-                title,
-                channel_name,
-                channel_id,
-                description,
-                duration_sec,
-                is_live,
-                is_short,
-                interaction_type,
-                percent_watched,
+                &Interaction {
+                    video_id,
+                    title,
+                    channel_name,
+                    channel_id,
+                    description,
+                    duration_sec,
+                    is_live,
+                    is_short,
+                    kind: interaction_type,
+                    percent_watched,
+                    seconds_since_impression,
+                },
             )
         };
+        if outcome.learning_rate.is_some_and(|rate| rate > 0.0) {
+            self.impression_cache.lock().unwrap().remove(video_id);
+        }
 
         let Some(learning_rate) = outcome.learning_rate else {
             return Ok(());
@@ -1701,29 +1731,33 @@ impl RecommendationService {
     /// Folds a progress report into the open watch session. A report for another video
     /// finishes the previous session and opens a new one, which counts as the click.
     pub async fn report_watch_progress(&self, report: WatchReport) -> AppResult<()> {
-        if report.is_music {
+        if report.is_music || self.learning_paused().await {
             return Ok(());
         }
-        let (finished, opened) = {
+        let (finished, click) = {
             let mut slot = self.watch.lock().unwrap();
-            match slot.session.as_mut() {
+            let finished = match slot.session.as_mut() {
                 Some(session) if session.report.video_id == report.video_id => {
                     session.ended = false;
                     session.absorb(report);
-                    (None, None)
+                    None
                 }
                 _ => {
                     slot.generation += 1;
                     let session = WatchSession::start(report, slot.generation);
-                    let opened = session.report.clone();
-                    (slot.session.replace(session), Some(opened))
+                    slot.session.replace(session)
                 }
-            }
+            };
+            let click = slot
+                .session
+                .as_mut()
+                .and_then(|session| session.take_click().then(|| session.report.clone()));
+            (finished, click)
         };
         if let Some(previous) = finished {
             self.finish_watch(previous).await?;
         }
-        if let Some(report) = opened {
+        if let Some(report) = click {
             self.log_watch_event(&report, InteractionType::Click, 0.0)
                 .await?;
         }
@@ -1778,7 +1812,15 @@ impl RecommendationService {
         Ok(())
     }
 
-    async fn finish_watch(&self, session: WatchSession) -> AppResult<()> {
+    async fn finish_watch(&self, mut session: WatchSession) -> AppResult<()> {
+        // Without a title the session cannot say what was watched, so it teaches nothing.
+        if session.report.title.trim().is_empty() {
+            return Ok(());
+        }
+        if session.take_click() {
+            self.log_watch_event(&session.report, InteractionType::Click, 0.0)
+                .await?;
+        }
         let Some(verdict) = session.verdict() else {
             return Ok(());
         };
@@ -1819,7 +1861,7 @@ impl RecommendationService {
     }
 
     pub async fn record_feed_impressions(&self, videos: Vec<VideoSummary>) -> AppResult<()> {
-        if videos.is_empty() {
+        if videos.is_empty() || self.learning_paused().await {
             return Ok(());
         }
 
@@ -1907,12 +1949,7 @@ impl RecommendationService {
                 0.30
             };
             for token in brain.key_spec().keys_of(trimmed) {
-                brain.global_vector.topics.insert(token.clone(), weight);
-                brain
-                    .global_vector
-                    .topic_confidence
-                    .insert(token.clone(), 1.0);
-                brain.global_vector.anchor_topics.insert(token.clone());
+                brain.global_vector.topics.insert(token, weight);
             }
             preferred.insert(trimmed.to_string());
         }
@@ -2307,7 +2344,12 @@ impl RecommendationService {
             let key_lower = key.to_lowercase();
             !key_lower.contains(&lemma) && !key_lower.contains(&normalized)
         });
-        for vector in brain.time_vectors.values_mut() {
+        let brain = &mut *brain;
+        for vector in brain
+            .time_vectors
+            .values_mut()
+            .chain([&mut brain.recent_vector, &mut brain.shorts_vector])
+        {
             vector.topics.retain(|key, _| {
                 let key_lower = key.to_lowercase();
                 !key_lower.contains(&lemma) && !key_lower.contains(&normalized)
@@ -2334,15 +2376,7 @@ impl RecommendationService {
         );
         for token in brain.key_spec().keys_of(trimmed) {
             let current = *brain.global_vector.topics.get(&token).unwrap_or(&0.0);
-            brain
-                .global_vector
-                .topics
-                .insert(token.clone(), current.max(0.5));
-            brain
-                .global_vector
-                .topic_confidence
-                .insert(token.clone(), 1.0);
-            brain.global_vector.anchor_topics.insert(token);
+            brain.global_vector.topics.insert(token, current.max(0.5));
         }
         brain.has_completed_onboarding = true;
         Ok(())
@@ -2381,6 +2415,70 @@ impl RecommendationService {
         brain.channel_scores.remove(&channel_id);
         brain.suppressed_channels.remove(&channel_id);
         brain.channel_strikes.remove(&channel_id);
+        Ok(())
+    }
+
+    /// Learns from a typed search; returns whether the query held a usable topic.
+    pub async fn learn_from_search(&self, query: String) -> AppResult<bool> {
+        if self.learning_paused().await {
+            return Ok(false);
+        }
+        let now_ms = self.get_current_time_ms();
+        Ok(learn_search(
+            &mut *self.brain_store.write().await,
+            &query,
+            now_ms,
+        ))
+    }
+
+    pub async fn note_subscription(
+        &self,
+        channel_id: String,
+        channel_name: String,
+        subscribed: bool,
+    ) -> AppResult<()> {
+        if self.learning_paused().await {
+            return Ok(());
+        }
+        let channel_id = channel_id.trim().trim_start_matches("channel:");
+        subscription_changed(
+            &mut *self.brain_store.write().await,
+            channel_id,
+            &channel_name,
+            subscribed,
+        );
+        Ok(())
+    }
+
+    /// Reads what channels are about from upload titles a feed already fetched, once per channel
+    /// per session.
+    pub async fn observe_channel_uploads(&self, uploads: Vec<VideoSummary>) -> AppResult<()> {
+        if self.learning_paused().await {
+            return Ok(());
+        }
+        let mut by_channel: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let profiled = self.profiled_channels.lock().unwrap();
+            for video in uploads {
+                let Some(channel_id) = video
+                    .channel_id
+                    .as_deref()
+                    .map(|id| id.trim().trim_start_matches("channel:").to_string())
+                    .filter(|id| !id.is_empty() && !profiled.contains(id))
+                else {
+                    continue;
+                };
+                by_channel.entry(channel_id).or_default().push(video.title);
+            }
+        }
+        if by_channel.is_empty() {
+            return Ok(());
+        }
+        self.profiled_channels
+            .lock()
+            .unwrap()
+            .extend(by_channel.keys().cloned());
+        learn_from_uploads(&mut *self.brain_store.write().await, &by_channel);
         Ok(())
     }
 
@@ -2470,6 +2568,43 @@ mod tests {
     }
 
     #[test]
+    fn traces_of_a_half_watched_video_are_never_searched_for() {
+        let mut brain = UserBrain::default();
+        brain
+            .global_vector
+            .topics
+            .insert("snapdragon".to_string(), 0.5);
+        brain
+            .global_vector
+            .topics
+            .insert("sourdough".to_string(), 0.0115);
+        let names: Vec<String> =
+            RecommendationService::analyze_mature_topics(&brain, &HashMap::new())
+                .into_iter()
+                .map(|topic| topic.name)
+                .collect();
+        assert!(names.contains(&"snapdragon".to_string()));
+        assert!(!names.contains(&"sourdough".to_string()));
+    }
+
+    #[test]
+    fn topics_in_any_script_can_become_queries() {
+        let spec = KeySpec::default();
+        for topic in ["طبخ", "кулинария", "料理", "snapdragon"] {
+            assert!(
+                RecommendationService::is_substantial_topic(topic, &spec),
+                "{topic}"
+            );
+        }
+        for topic in ["better", "normal", "2026", "3.1"] {
+            assert!(
+                !RecommendationService::is_substantial_topic(topic, &spec),
+                "{topic}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_viral_and_numeric_discovery_fragments() {
         assert!(!RecommendationService::is_substantial_topic(
             "viral",
@@ -2490,15 +2625,14 @@ mod tests {
     }
 
     #[test]
-    fn bonds_anchor_topics_to_emerging_bigrams_for_young_profiles() {
+    fn bonds_picks_to_emerging_bigrams_for_young_profiles() {
         let mut brain = UserBrain::default();
         brain.total_interactions = 12;
-        brain.global_vector.topics.insert("game".to_string(), 0.75);
         brain
             .global_vector
-            .topic_confidence
-            .insert("game".to_string(), 1.0);
-        brain.global_vector.anchor_topics.insert("game".to_string());
+            .topics
+            .insert("minecraft".to_string(), 0.75);
+        brain.preferred_topics.insert("Minecraft".to_string());
         brain
             .global_vector
             .topics
@@ -2511,13 +2645,14 @@ mod tests {
         let queries = RecommendationService::build_query_bonding_candidates(&brain);
         let query_text: Vec<String> = queries.into_iter().map(|query| query.query).collect();
 
-        assert!(query_text.contains(&"Game Leg Day".to_string()));
-        assert!(query_text.contains(&"Game Roblox Thief".to_string()));
+        assert!(query_text.contains(&"Minecraft Leg Day".to_string()));
+        assert!(query_text.contains(&"Minecraft Roblox Thief".to_string()));
     }
 
     #[test]
     fn search_text_is_spelled_as_titles_write_it() {
-        use crate::flow_neuro::signals::{InteractionType, apply_interaction};
+        use crate::flow_neuro::learning::{Interaction, apply_interaction};
+        use crate::flow_neuro::signals::InteractionType;
 
         let mut brain = UserBrain::default();
         let titles = [
@@ -2529,16 +2664,19 @@ mod tests {
             for (index, title) in titles.iter().enumerate() {
                 apply_interaction(
                     &mut brain,
-                    &format!("v{round}{index}"),
-                    title,
-                    "Luthier Bench",
-                    "c1",
-                    None,
-                    Some(900),
-                    false,
-                    false,
-                    InteractionType::Watched,
-                    0.9,
+                    &Interaction {
+                        video_id: &format!("v{round}{index}"),
+                        title,
+                        channel_name: "Luthier Bench",
+                        channel_id: "c1",
+                        description: None,
+                        duration_sec: Some(900),
+                        is_live: false,
+                        is_short: false,
+                        kind: InteractionType::Watched,
+                        percent_watched: 0.9,
+                        seconds_since_impression: None,
+                    },
                 );
             }
         }
@@ -2569,7 +2707,7 @@ mod tests {
         let mut brain = UserBrain::default();
         brain.total_interactions = 50;
         brain.global_vector.topics.insert("game".to_string(), 0.75);
-        brain.global_vector.anchor_topics.insert("game".to_string());
+        brain.preferred_topics.insert("Game".to_string());
         brain
             .global_vector
             .topics

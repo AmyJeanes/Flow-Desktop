@@ -21,6 +21,16 @@ export interface FeedQuotas {
   viralLimit: number;
 }
 
+/** Below this a topic is a trace of evidence still adding up, not an interest to show. */
+export const INTEREST_MIN_WEIGHT = 0.03;
+
+/** The topics of a taste vector strong enough to be interests. */
+export function interestTopics(topics: Record<string, number> | undefined): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(topics ?? {}).filter(([, weight]) => weight >= INTEREST_MIN_WEIGHT),
+  );
+}
+
 const MOCK_FEED_QUOTAS: FeedQuotas = {
   maturity: "mature",
   totalInteractions: 168,
@@ -343,6 +353,29 @@ export async function getBrainSnapshot(forceRefresh?: boolean): Promise<UserBrai
   brainCache = result;
   brainCacheTime = now;
   return result;
+}
+
+/** A typed search is the most explicit interest statement there is; it teaches the engine once. */
+export async function learnFromSearch(query: string): Promise<void> {
+  if (!query.trim() || isDeepFlowCurrentlyActive() || !(await isTauriEnv())) return;
+  await invokeBackend<boolean>("learn_from_search", { query });
+  brainCache = null;
+}
+
+/** Following a channel lifts it and teaches its name; unfollowing returns it to neutral. */
+export async function noteSubscription(
+  channelId: string,
+  channelName: string,
+  subscribed: boolean,
+): Promise<void> {
+  if (isDeepFlowCurrentlyActive() || !(await isTauriEnv())) return;
+  await invokeBackend<void>("note_subscription", { channelId, channelName, subscribed });
+}
+
+/** Upload titles a feed already fetched say what each channel is about. */
+export async function observeChannelUploads(uploads: VideoSummary[]): Promise<void> {
+  if (uploads.length === 0 || isDeepFlowCurrentlyActive() || !(await isTauriEnv())) return;
+  await invokeBackend<void>("observe_channel_uploads", { uploads });
 }
 
 /** One imported watch-history entry the engine can learn from. */
