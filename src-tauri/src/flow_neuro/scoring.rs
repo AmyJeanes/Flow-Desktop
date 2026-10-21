@@ -20,6 +20,8 @@ pub const CHANNEL_BOREDOM_MULTIPLIER: f64 = 0.5;
 pub const CHANNEL_BOREDOM_THRESHOLD: f64 = 0.05;
 pub const CHANNEL_EMA_ALPHA: f64 = 0.05;
 pub const CHANNEL_EMA_DECAY: f64 = 1.0 - CHANNEL_EMA_ALPHA;
+/// A thumbs-down halves the channel's score; it never hides the channel.
+pub const DISLIKE_CHANNEL_FACTOR: f64 = 0.5;
 pub const MAX_CHANNEL_SCORES: usize = 500;
 pub const CHANNEL_KEEP_LOW: usize = 50;
 pub const CHANNEL_KEEP_HIGH: usize = 200;
@@ -40,7 +42,6 @@ pub const DEVELOPING_DECAY_RATE: f64 = 0.993;
 pub const EMERGING_DECAY_RATE: f64 = 0.97;
 
 pub const MAX_CONSECUTIVE_SKIPS: i32 = 30;
-pub const NOT_INTERESTED_SKIP_INCREMENT: i32 = 3;
 
 pub const COLD_START_THRESHOLD: i32 = 30;
 pub const ONBOARDING_WARMUP_INTERACTIONS: i32 = 50;
@@ -86,9 +87,10 @@ pub const SESSION_AFFINITY_STRONG_BOOST: f64 = 0.08;
 pub const SESSION_AFFINITY_MILD_THRESHOLD: usize = 2;
 pub const SESSION_AFFINITY_MILD_BOOST: f64 = 0.04;
 
-pub const AFFINITY_INCREMENT: f64 = 0.02;
+pub const AFFINITY_INCREMENT: f64 = 0.03;
+/// A watch links each pair of its strongest topics.
+pub const AFFINITY_TOP_TOPICS: usize = 3;
 pub const AFFINITY_MAX: f64 = 1.0;
-pub const AFFINITY_PRUNE_THRESHOLD: f64 = 0.05;
 pub const AFFINITY_MAX_ENTRIES: usize = 500;
 pub const AFFINITY_KEEP_TOP: usize = 300;
 pub const AFFINITY_MAX_BOOST_PER_VIDEO: f64 = 0.15;
@@ -156,9 +158,16 @@ pub const WATCHED_PENALTY_HALF: f64 = 0.30;
 pub const WATCHED_PENALTY_FULL: f64 = 0.02;
 
 pub const MUSIC_REWATCH_MAX_DURATION: u64 = 480;
-pub const VIDEO_SUPPRESSION_DAYS: u64 = 30;
+/// Longest a video can be and still count as a Short.
+pub const SHORT_MAX_SECONDS: u64 = 60;
+
+/// A Short only when its length is known: an unknown length is not a guess at one.
+pub fn is_known_short(duration_seconds: Option<u64>) -> bool {
+    duration_seconds.is_some_and(|seconds| seconds > 0 && seconds <= SHORT_MAX_SECONDS)
+}
 pub const CHANNEL_SUPPRESSION_DAYS: u64 = 14;
-pub const MAX_SUPPRESSED_VIDEOS: usize = 500;
+/// A rejected video stays hidden for good; past this many the oldest rejections are dropped.
+pub const MAX_SUPPRESSED_VIDEOS: usize = 5_000;
 pub const MAX_SUPPRESSED_CHANNELS: usize = 100;
 
 // Channel strike escalation: an inferred (reversible, expiring) block requires sustained,
@@ -166,7 +175,6 @@ pub const MAX_SUPPRESSED_CHANNELS: usize = 100;
 pub const CHANNEL_STRIKE_BLOCK_THRESHOLD: i32 = 3;
 pub const CHANNEL_STRIKE_MIN_SPREAD_MS: u64 = 86_400_000;
 pub const CHANNEL_INFERRED_BLOCK_DAYS: u64 = 60;
-pub const MAX_CHANNEL_STRIKES: usize = 200;
 pub const REJECTION_EXPIRY_DAYS: u64 = 14;
 pub const REJECTION_MEMORY_MAX: usize = 200;
 pub const REJECTION_PENALTY_1: f64 = 0.50;
@@ -316,6 +324,20 @@ pub struct UserBrain {
     /// Videos already counted toward document frequency in this run of the app.
     #[serde(skip)]
     pub counted_documents: HashSet<String>,
+}
+
+impl UserBrain {
+    /// A fresh brain that still carries every block and "not interested" mark of this one.
+    #[must_use]
+    pub fn keeping_hidden_content(&self) -> Self {
+        Self {
+            blocked_channels: self.blocked_channels.clone(),
+            blocked_topics: self.blocked_topics.clone(),
+            suppressed_video_ids: self.suppressed_video_ids.clone(),
+            suppressed_channels: self.suppressed_channels.clone(),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for UserBrain {
@@ -1532,6 +1554,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_known_length_makes_a_short() {
+        assert!(is_known_short(Some(45)));
+        assert!(!is_known_short(Some(61)));
+        assert!(!is_known_short(Some(0)));
+        assert!(!is_known_short(None));
+    }
+
+    #[test]
     fn disjoint_topics_are_damped_below_relevance_floor() {
         let mut user = ContentVector::default();
         user.topics.insert("guitar".to_string(), 1.0);
@@ -1655,5 +1685,25 @@ mod tests {
         assert!(brain.global_vector.topic_confidence.is_empty());
         assert!(brain.global_vector.anchor_topics.is_empty());
         assert!(brain.has_completed_onboarding);
+    }
+
+    #[test]
+    fn a_reset_keeps_only_what_the_viewer_hid() {
+        let mut brain = UserBrain::default();
+        brain.total_interactions = 40;
+        brain.global_vector.topics.insert("rust".into(), 0.7);
+        brain.preferred_topics.insert("Rust".into());
+        brain.blocked_channels.insert("UCx".into());
+        brain.blocked_topics.insert("drama".into());
+        brain.suppressed_video_ids.insert("v1".into(), 1);
+        brain.suppressed_channels.insert("UCy".into(), 1);
+        let fresh = brain.keeping_hidden_content();
+        assert_eq!(fresh.total_interactions, 0);
+        assert!(fresh.global_vector.topics.is_empty());
+        assert!(fresh.preferred_topics.is_empty());
+        assert!(fresh.blocked_channels.contains("UCx"));
+        assert!(fresh.blocked_topics.contains("drama"));
+        assert!(fresh.suppressed_video_ids.contains_key("v1"));
+        assert!(fresh.suppressed_channels.contains_key("UCy"));
     }
 }

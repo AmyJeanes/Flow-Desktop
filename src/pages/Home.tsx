@@ -10,14 +10,12 @@ import {
 import {
   generateDiscoveryQueries,
   getFeedQuotas,
-  recordFeedImpressions,
   rankVideos,
-  logInteraction,
 } from "../lib/api/recommendation";
 import type { FeedQuotas } from "../lib/api/recommendation";
-import { cleanChannelId, useFeedActionsStore, useFeedHiddenFilter } from "../store/useFeedActionsStore";
+import { useFeedActionsStore, useFeedHiddenFilter } from "../store/useFeedActionsStore";
 import { useAppSettingsStore } from "../store/useAppSettingsStore";
-import { getSetting, setSetting, getWatchHistory } from "../lib/api/db";
+import { getSetting, getWatchHistory } from "../lib/api/db";
 import { getString } from "../lib/i18n/index";
 import { SETTINGS } from "../lib/settings/schema";
 import type { VideoSummary } from "../types/video";
@@ -31,6 +29,9 @@ import {
   hideContinueWatchingVideo,
 } from "../lib/continueWatching";
 import { reconcileHomeFeedResults } from "../lib/homeFeedResults";
+import { homeFeedCache, loadPersistedDiscoverFeed, persistDiscoverFeed } from "../lib/homeFeedCache";
+import { isKnownShort } from "../lib/videoKind";
+import { isMusicVideo } from "../lib/utils";
 import {
   createDiscoveryPaging,
   hasDiscoveryPagesLeft,
@@ -69,11 +70,6 @@ const STANDARD_DISCOVER_QUOTAS: FeedQuotas = {
   viralLimit: 10,
 };
 
-const homeFeedCache: Record<"discover" | "trending", { videos: VideoSummary[]; timestamp: number }> = {
-  discover: { videos: [], timestamp: 0 },
-  trending: { videos: [], timestamp: 0 },
-};
-
 const logHomeFeed = (stage: string, details: Record<string, unknown>) => {
   console.info(`[home-feed] ${stage}`, details);
 };
@@ -106,48 +102,6 @@ const buildContinueWatchingVideos = (history: WatchHistoryRecord[]): VideoSummar
   }
 
   return videos.slice(0, 20);
-};
-
-// Persistent discover feed: survives process restart for an instant cold-start paint and an
-// offline floor, unlike the in-memory `homeFeedCache`. Reconciled by the background refresh.
-const PERSISTED_FEED_KEY = "home_discover_cache_v1";
-const PERSISTED_FEED_TTL_MS = 24 * 60 * 60 * 1000;
-
-const persistDiscoverFeed = async (videos: VideoSummary[]) => {
-  if (videos.length === 0) return;
-  try {
-    const payload = JSON.stringify({ videos: videos.slice(0, 60), timestamp: Date.now() });
-    await setSetting(PERSISTED_FEED_KEY, payload);
-  } catch (error) {
-    console.warn("Failed to persist discover feed", error);
-  }
-};
-
-const loadPersistedDiscoverFeed = async (): Promise<VideoSummary[] | null> => {
-  try {
-    const raw = await getSetting(PERSISTED_FEED_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as { videos?: VideoSummary[]; timestamp?: number };
-    if (!parsed.videos?.length) return null;
-    if (Date.now() - (parsed.timestamp ?? 0) > PERSISTED_FEED_TTL_MS) return null;
-    const { dismissedVideoIds, blockedChannelIds, suppressedChannelIds, watchedVideoIds } = useFeedActionsStore.getState();
-    return parsed.videos.filter(
-      (video) => {
-        if (!video || typeof video.id !== "string") {
-          return false;
-        }
-        const channelId = cleanChannelId(video.channelId);
-        return (
-          !dismissedVideoIds.has(video.id) &&
-          !watchedVideoIds.has(video.id) &&
-          !(channelId && (blockedChannelIds.has(channelId) || suppressedChannelIds.has(channelId)))
-        );
-      },
-    );
-  } catch (error) {
-    console.warn("Failed to load persisted discover feed", error);
-    return null;
-  }
 };
 
   const summarizeVideosForLog = (items: VideoSummary[]) => (
@@ -203,7 +157,6 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
   const [hasMoreDiscover, setHasMoreDiscover] = useState(true);
   const scrollContainer = useScrollContainer();
   const requestSequenceRef = useRef(0);
-  const lastImpressionSignatureRef = useRef<string>("");
   const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
   const loadMoreObserverRef = useRef<IntersectionObserver | null>(null);
   // IntersectionObserver only reports transitions, so once the sentinel is intersecting it
@@ -349,12 +302,16 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
     return published.includes("live") || views.includes("watching");
   };
 
+  // Android's filterValid: no Shorts, and a known length unless the video is live. Songs
+  // belong to the music player, not the video feed.
   const isValidFeedVideo = (video: VideoSummary) => {
-    const duration = video.durationSeconds ?? 0;
-    if (isLikelyLive(video)) {
+    if (isMusicVideo(video)) {
+      return false;
+    }
+    if (video.isLive || isLikelyLive(video)) {
       return true;
     }
-    return duration > 120;
+    return (video.durationSeconds ?? 0) > 0 && !isKnownShort(video.durationSeconds);
   };
 
   const getMostlyWatchedIds = (history: WatchHistoryRecord[]) => {
@@ -801,8 +758,7 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
     const freshValid = uniqueByVideoId(fresh)
       .filter((video) => {
         if (watched.has(video.id) || isHidden(video)) return false;
-        const duration = video.durationSeconds;
-        return duration == null || duration > 60;
+        return !isKnownShort(video.durationSeconds);
       })
       .slice(0, maxFresh);
     const freshIds = new Set(freshValid.map((video) => video.id));
@@ -1051,9 +1007,6 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
         logHomeFeed("load-more-appended", {
           appendedCount: appendedVideos.length,
           sample: summarizeVideosForLog(appendedVideos),
-        });
-        void recordFeedImpressions(appendedVideos.slice(0, 12)).catch((error) => {
-          console.warn("Failed to record appended feed impressions", error);
         });
       } else {
         registerLoadMoreMiss("load-more-no-append", { dedupedBatchCount: dedupedBatch.length });
@@ -1609,29 +1562,6 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
     };
   }, [activeTab, homeFeedEnabled, hideWatchedVideos]);
 
-  useEffect(() => {
-    if (loading || videos.length === 0) {
-      return;
-    }
-
-    const impressionBatch = videos.filter((video) => !isHidden(video)).slice(0, 24);
-    const signature = `${activeTab}:${impressionBatch.map((video) => video.id).join("|")}`;
-    if (signature === lastImpressionSignatureRef.current) {
-      return;
-    }
-    lastImpressionSignatureRef.current = signature;
-
-    logHomeFeed("record-impressions", {
-      activeTab,
-      count: impressionBatch.length,
-      sample: summarizeVideosForLog(impressionBatch),
-    });
-
-    void recordFeedImpressions(impressionBatch).catch((error) => {
-      console.warn("Failed to record feed impressions", error);
-    });
-  }, [activeTab, loading, videos, isHidden]);
-
   // handleLoadMore closes over per-render state, so the mount-once observer reaches it
   // through a ref that always points at the latest render's closure.
   useEffect(() => {
@@ -1714,26 +1644,6 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
     them, so an unstable identity here is what decides whether `React.memo` on
     VideoCard can bail out at all.
   */
-  const handlePlayVideo = useCallback(async (video: VideoSummary) => {
-    onPlay(video);
-    try {
-      await logInteraction(
-        video.id,
-        video.title,
-        video.channelName,
-        video.channelId ?? video.id,
-        null,
-        video.durationSeconds ?? null,
-        false,
-        (video.durationSeconds ?? 0) <= 60,
-        "CLICK",
-        0.0
-      );
-    } catch (err) {
-      console.warn("Failed to log interaction", err);
-    }
-  }, [onPlay]);
-
   const handleRemoveFromContinueWatching = useCallback((videoId: string) => {
     hideContinueWatchingVideo(videoId);
     setContinueWatchingVideos((current) => current.filter((video) => video.id !== videoId));
@@ -1768,7 +1678,7 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
       <VideoShelf
         title={getString("continue_watching_shelf_title")}
         videos={visibleContinueWatchingVideos}
-        onPlay={handlePlayVideo}
+        onPlay={onPlay}
         onAddToQueue={onAddToQueue}
         onRemoveFromContinueWatching={handleRemoveFromContinueWatching}
         variant="continue"
@@ -1777,7 +1687,7 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
     [
       shouldInsertContinueShelf,
       visibleContinueWatchingVideos,
-      handlePlayVideo,
+      onPlay,
       onAddToQueue,
       handleRemoveFromContinueWatching,
     ],
@@ -1797,7 +1707,7 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
           </p>
         </div>
       ) : loading ? (
-        <VideoGrid loading={true} onPlay={handlePlayVideo} />
+        <VideoGrid loading={true} onPlay={onPlay} />
       ) : visibleVideos.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-24 text-center border border-dashed border-chrome-zinc-800 rounded-3xl p-8 bg-chrome-zinc-900/10">
           <h3 className="font-bold text-chrome-zinc-300">{getString("home_feed_empty_title")}</h3>
@@ -1809,9 +1719,10 @@ export const Home: React.FC<HomeProps> = ({ onPlay, onAddToQueue }) => {
         <>
           <VideoGrid
             videos={visibleVideos}
-            onPlay={handlePlayVideo}
+            onPlay={onPlay}
             onAddToQueue={onAddToQueue}
             insertNode={continueShelfNode}
+            trackImpressions
           />
 
           {activeTab === "discover" && (

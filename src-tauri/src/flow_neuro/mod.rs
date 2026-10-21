@@ -1,3 +1,4 @@
+pub(crate) mod bootstrap;
 pub(crate) mod brain_store;
 pub(crate) mod display_forms;
 #[cfg(test)]
@@ -10,3 +11,4 @@ pub(crate) mod language;
 pub(crate) mod ranker;
 pub(crate) mod scoring;
 pub(crate) mod signals;
+pub(crate) mod watch_session;

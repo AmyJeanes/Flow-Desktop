@@ -7,7 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 use crate::db::recommendations;
-use crate::errors::AppResult;
+use crate::errors::{AppError, AppResult};
+use crate::flow_neuro::bootstrap::{
+    ImportedVideo, bootstrap_from_history, bootstrap_from_subscriptions,
+};
 use crate::flow_neuro::brain_store::BrainStore;
 use crate::flow_neuro::display_forms::{label, with_pick_spellings};
 use crate::flow_neuro::features::{
@@ -15,17 +18,18 @@ use crate::flow_neuro::features::{
 };
 use crate::flow_neuro::keyed_lists::{DISCOVERY_NOISE_WORDS, keyed_lists};
 use crate::flow_neuro::keyspec::KeySpec;
+use crate::flow_neuro::language::system_language;
 use crate::flow_neuro::ranker;
 use crate::flow_neuro::scoring::{
     CHANNEL_SUPPRESSION_DAYS, FEED_HISTORY_EXPIRY_DAYS, FEED_HISTORY_MAX, FeedEntry, FlowPersona,
     IMPRESSION_CACHE_MAX, IdfSnapshot, JITTER_COLD_START, JITTER_NORMAL,
     ONBOARDING_WARMUP_INTERACTIONS, QUERY_OVERLAP_THRESHOLD, QUERY_ROTATION_FLOOR,
     QUERY_ROTATION_RECENT_WINDOW, RECENT_QUERY_TOKENS_MAX, SESSION_TOPIC_HISTORY_MAX, ScoredVideo,
-    TimeBucket, TopicEvidence, UserBrain, VIDEO_SUPPRESSION_DAYS, apply_smart_diversity,
-    channel_inferred_blocked, classify_persona, get_topic_categories, is_music_track,
-    strip_domain_tag,
+    TimeBucket, TopicEvidence, UserBrain, apply_smart_diversity, channel_inferred_blocked,
+    classify_persona, get_topic_categories, is_known_short, is_music_track, strip_domain_tag,
 };
 use crate::flow_neuro::signals::{InteractionType, apply_interaction};
+use crate::flow_neuro::watch_session::{WatchReport, WatchSession};
 use crate::models::video::{MusicHomeChip, MusicHomeSection, VideoSummary};
 use crate::services::youtube_service::YoutubeService;
 
@@ -44,8 +48,15 @@ pub struct RecommendationService {
     impression_cache: Mutex<HashMap<String, (i32, u64)>>, // video_id -> (seen_count, last_seen_timestamp)
     session_topic_history: Mutex<Vec<String>>,
     session_video_count: Mutex<i32>,
+    watch: Mutex<WatchSlot>,
     #[allow(dead_code)]
     session_start_time: u64,
+}
+
+#[derive(Default)]
+struct WatchSlot {
+    session: Option<WatchSession>,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -257,6 +268,7 @@ impl RecommendationService {
             impression_cache: Mutex::new(HashMap::new()),
             session_topic_history: Mutex::new(Vec::new()),
             session_video_count: Mutex::new(0),
+            watch: Mutex::new(WatchSlot::default()),
             session_start_time: now,
         }
     }
@@ -1436,7 +1448,6 @@ impl RecommendationService {
 
         let brain = self.brain_store.read().await;
         let now_ms = self.get_current_time_ms();
-        let video_cutoff = now_ms.saturating_sub(VIDEO_SUPPRESSION_DAYS * 86_400_000);
         let channel_cutoff = now_ms.saturating_sub(CHANNEL_SUPPRESSION_DAYS * 86_400_000);
 
         // 1. Pre-filter blocked channels and topics
@@ -1444,12 +1455,7 @@ impl RecommendationService {
             .into_iter()
             .filter(|video| {
                 let channel_id = video.channel_id.as_deref().unwrap_or(&video.id);
-                if brain
-                    .suppressed_video_ids
-                    .get(&video.id)
-                    .map(|ts| *ts >= video_cutoff)
-                    .unwrap_or(false)
-                {
+                if brain.suppressed_video_ids.contains_key(&video.id) {
                     return false;
                 }
                 if !lenient
@@ -1574,14 +1580,14 @@ impl RecommendationService {
 
         for video in filtered {
             let channel_id = video.channel_id.clone().unwrap_or_else(|| video.id.clone());
-            let is_short = video.duration_seconds.unwrap_or(0) <= 60;
+            let is_short = is_known_short(video.duration_seconds);
             let video_vector = extract_features(
                 &VideoText {
                     title: &video.title,
                     channel_name: &video.channel_name,
                     description: None, // Feeds don't carry descriptions
                     duration_seconds: video.duration_seconds,
-                    is_live: false,
+                    is_live: video.is_live,
                     is_short,
                 },
                 &TopicReader {
@@ -1593,10 +1599,7 @@ impl RecommendationService {
             let candidate = ranker::Candidate {
                 video_vector: &video_vector,
                 video_id: &video.id,
-                title: &video.title,
-                channel_name: &video.channel_name,
                 channel_id: &channel_id,
-                duration_seconds: video.duration_seconds,
                 published_text: video.published_text.as_deref().unwrap_or(""),
                 view_count: Self::parse_view_count(video.view_count_text.as_deref()),
                 is_subscription: user_subs.contains(&channel_id),
@@ -1693,6 +1696,126 @@ impl RecommendationService {
         }
 
         Ok(())
+    }
+
+    /// Folds a progress report into the open watch session. A report for another video
+    /// finishes the previous session and opens a new one, which counts as the click.
+    pub async fn report_watch_progress(&self, report: WatchReport) -> AppResult<()> {
+        if report.is_music {
+            return Ok(());
+        }
+        let (finished, opened) = {
+            let mut slot = self.watch.lock().unwrap();
+            match slot.session.as_mut() {
+                Some(session) if session.report.video_id == report.video_id => {
+                    session.ended = false;
+                    session.absorb(report);
+                    (None, None)
+                }
+                _ => {
+                    slot.generation += 1;
+                    let session = WatchSession::start(report, slot.generation);
+                    let opened = session.report.clone();
+                    (slot.session.replace(session), Some(opened))
+                }
+            }
+        };
+        if let Some(previous) = finished {
+            self.finish_watch(previous).await?;
+        }
+        if let Some(report) = opened {
+            self.log_watch_event(&report, InteractionType::Click, 0.0)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Ends the open session for this video. A natural end is final at once; any other end
+    /// waits for the same video to come back, and returns the generation to settle later.
+    pub async fn end_watch_session(
+        &self,
+        report: WatchReport,
+        natural: bool,
+    ) -> AppResult<Option<u64>> {
+        let finished = {
+            let mut slot = self.watch.lock().unwrap();
+            let Some(session) = slot.session.as_mut() else {
+                return Ok(None);
+            };
+            if session.report.video_id != report.video_id {
+                return Ok(None);
+            }
+            session.absorb(report);
+            if !natural {
+                session.ended = true;
+                return Ok(Some(session.generation));
+            }
+            slot.session.take()
+        };
+        if let Some(session) = finished {
+            self.finish_watch(session).await?;
+        }
+        Ok(None)
+    }
+
+    /// Finishes an ended session that nothing resumed. `None` finishes whatever is open, ended
+    /// or not, which is what quitting the app means.
+    pub async fn settle_watch_session(&self, generation: Option<u64>) -> AppResult<()> {
+        let finished = {
+            let mut slot = self.watch.lock().unwrap();
+            let settles = slot
+                .session
+                .as_ref()
+                .is_some_and(|session| match generation {
+                    Some(generation) => session.ended && session.generation == generation,
+                    None => true,
+                });
+            if settles { slot.session.take() } else { None }
+        };
+        if let Some(session) = finished {
+            self.finish_watch(session).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_watch(&self, session: WatchSession) -> AppResult<()> {
+        let Some(verdict) = session.verdict() else {
+            return Ok(());
+        };
+        self.log_watch_event(
+            &session.report,
+            verdict.interaction,
+            verdict.percent_watched,
+        )
+        .await
+    }
+
+    async fn log_watch_event(
+        &self,
+        report: &WatchReport,
+        interaction: InteractionType,
+        percent_watched: f32,
+    ) -> AppResult<()> {
+        let duration = (report.duration > 0.0)
+            .then(|| std::time::Duration::from_secs_f64(report.duration + 0.5).as_secs());
+        let channel_id = if report.channel_id.is_empty() {
+            &report.video_id
+        } else {
+            &report.channel_id
+        };
+        self.log_video_interaction(
+            &report.video_id,
+            &report.title,
+            &report.channel_name,
+            channel_id,
+            report.description.as_deref(),
+            duration,
+            report.is_live,
+            is_known_short(duration),
+            interaction,
+            percent_watched,
+        )
+        .await
     }
 
     pub async fn record_feed_impressions(&self, videos: Vec<VideoSummary>) -> AppResult<()> {
@@ -2261,11 +2384,46 @@ impl RecommendationService {
         Ok(())
     }
 
+    /// Learns gently from an imported watch history; returns how many videos it learned from.
+    pub async fn bootstrap_from_history(&self, videos: Vec<ImportedVideo>) -> AppResult<usize> {
+        let learned = bootstrap_from_history(&mut *self.brain_store.write().await, videos);
+        info!(learned, "[FlowNeuro] bootstrapped from imported history");
+        Ok(learned)
+    }
+
+    /// Seeds topics from imported subscription names; returns how many topics it seeded.
+    pub async fn bootstrap_from_subscriptions(
+        &self,
+        channel_names: Vec<String>,
+    ) -> AppResult<usize> {
+        let seeded =
+            bootstrap_from_subscriptions(&mut *self.brain_store.write().await, &channel_names);
+        info!(
+            seeded,
+            "[FlowNeuro] bootstrapped from imported subscriptions"
+        );
+        Ok(seeded)
+    }
+
+    /// Replaces the resident brain with an imported one, after checking it reads as a brain.
+    pub async fn import_brain(&self, brain: serde_json::Value) -> AppResult<()> {
+        let brain: UserBrain = serde_json::from_value(brain)
+            .map_err(|error| AppError::Validation(format!("Not a FlowNeuro brain: {error}")))?;
+        self.brain_store.replace(brain).await
+    }
+
+    /// Forgets everything learned but keeps what the viewer hid: blocks and "not interested"
+    /// marks are choices, not learning (Android `keepingHiddenContent`).
     pub async fn reset_brain(&self) -> AppResult<()> {
         {
             let mut brain = self.brain_store.write().await;
-            *brain = UserBrain::default();
+            *brain = brain.keeping_hidden_content();
+            brain.settle_languages(&system_language());
         }
+        self.impression_cache.lock().unwrap().clear();
+        self.session_topic_history.lock().unwrap().clear();
+        *self.session_video_count.lock().unwrap() = 0;
+        self.watch.lock().unwrap().session = None;
         recommendations::clear_recommendation_events(&self.pool).await
     }
 }
