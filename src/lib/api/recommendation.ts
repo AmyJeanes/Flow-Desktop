@@ -441,12 +441,13 @@ export async function unblockChannel(channelId: string): Promise<void> {
   brainCache = null;
 }
 
-export async function blockChannel(channelId: string): Promise<void> {
+/** Blocks a channel; its name is kept so Hidden channels can show it without a lookup. */
+export async function blockChannel(channelId: string, channelName?: string): Promise<void> {
   if (!(await isTauriEnv())) {
     console.log(`[FlowNeuro Mock] Blocking channel: ${channelId}`);
     return;
   }
-  await invokeBackend<void>("block_channel", { channelId });
+  await invokeBackend<void>("block_channel", { channelId, channelName: channelName || null });
   brainCache = null;
 }
 
@@ -460,4 +461,44 @@ export async function resetBrain(): Promise<void> {
   }
   await invokeBackend<void>("reset_brain");
   brainCache = null;
+}
+
+export interface TasteTopic {
+  key: string;
+  /** As titles write it; what a boost stores. */
+  label: string;
+  /** How often the viewer watched, liked or searched it. */
+  evidence: number;
+}
+
+export interface TasteGroup {
+  id: string;
+  label: string;
+  /** Relative to the strongest group, 0 to 1. */
+  share: number;
+  evidence: number;
+  members: TasteTopic[];
+}
+
+export interface NamedChannel {
+  id: string;
+  /** Empty when this device knows no name for it. */
+  name: string;
+}
+
+export interface TasteOverview {
+  picks: TasteTopic[];
+  groups: TasteGroup[];
+  hiddenChannels: NamedChannel[];
+}
+
+/** Names of hidden channels this device does not know, from their RSS feeds. */
+export async function resolveHiddenChannelNames(channelIds: string[]): Promise<Record<string, string>> {
+  if (channelIds.length === 0 || !(await isTauriEnv())) return {};
+  return invokeBackend<Record<string, string>>("resolve_hidden_channel_names", { channelIds });
+}
+
+export async function getTasteOverview(): Promise<TasteOverview> {
+  if (!(await isTauriEnv())) return { picks: [], groups: [], hiddenChannels: [] };
+  return invokeBackend<TasteOverview>("get_taste_overview");
 }

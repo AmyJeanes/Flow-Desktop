@@ -5,11 +5,12 @@
 //! commands return one, and every later change is emitted as `home-feed`.
 
 mod arrange;
-mod cache;
+pub(crate) mod cache;
 pub mod card;
 mod channel_memory;
+pub mod chips;
 mod filters;
-mod inputs;
+pub(crate) mod inputs;
 mod lanes;
 mod load;
 mod mixer;
@@ -107,6 +108,10 @@ struct Inner {
     subs_cursor: Mutex<usize>,
     /// Followed channels asked for a missing length lately: channel id to when.
     priority_asked: Mutex<HashMap<String, u64>>,
+    /// The interest chips last shown, so a chip's key finds its topics.
+    chips: Mutex<Vec<crate::flow_neuro::interest_chips::InterestChip>>,
+    /// Each chip's videos with when they were fetched.
+    chip_results: Mutex<HashMap<String, (Vec<Card>, u64)>>,
 }
 
 /// The Home feed service; cheap to clone into background work.
@@ -324,6 +329,7 @@ impl HomeFeedService {
         }
         self.inner.search_pages.reset();
         self.inner.related.clear();
+        self.inner.chip_results.lock().unwrap().clear();
         let pool = app.state::<sqlx::SqlitePool>();
         let _ = cache::clear(&pool).await;
         self.emit(app);

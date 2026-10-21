@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flow_neuro::categories::ChannelCategory;
-use crate::flow_neuro::clusters::{ClusterInputs, build_clusters};
+use crate::flow_neuro::clusters::{ClusterInputs, TopicCluster, build_clusters};
 use crate::flow_neuro::diversity::apply_smart_diversity;
 use crate::flow_neuro::features::{TopicReader, VideoText, extract_features_with_prior, pick_keys};
 use crate::flow_neuro::gates::{
@@ -47,8 +47,9 @@ pub struct RankContext<'a> {
     pub now_ms: u64,
     /// Above 0, candidates sharing less with the viewer's interests are left out (a Home lane).
     pub min_relevance: f64,
-    /// Shorts keep channels the viewer suppressed for a while, so the feed is not starved.
-    pub keep_suppressed_channels: bool,
+    /// The Shorts feed: every candidate is a Short, ranked against the Shorts taste and held back
+    /// once seen, and channels the viewer suppressed for a while stay so the feed is not starved.
+    pub shorts_feed: bool,
     pub session: SessionState<'a>,
     pub category_of: &'a dyn Fn(&str) -> Option<ChannelCategory>,
     pub co_watch_prior: &'a HashMap<String, f64>,
@@ -113,7 +114,7 @@ fn passes_hard_filters(
     let channel = channel_of(video);
     let channel_cutoff = ctx.now_ms.saturating_sub(CHANNEL_SUPPRESSION_DAYS * DAY_MS);
     !brain.suppressed_video_ids.contains_key(&video.id)
-        && (ctx.keep_suppressed_channels
+        && (ctx.shorts_feed
             || brain
                 .suppressed_channels
                 .get(channel)
@@ -217,7 +218,7 @@ pub fn rank(ctx: &RankContext, candidates: Vec<VideoSummary>) -> Vec<VideoSummar
 
     let base: Vec<f64> = vectors
         .iter()
-        .map(|(video, vector)| score_candidate(&params, &candidate(video, vector)))
+        .map(|(video, vector)| score_candidate(&params, &candidate(ctx, video, vector)))
         .collect();
     let jitter_unit = adaptive_jitter(brain.total_interactions, overlap) * median_of(&base);
     let mut jitter = Jitter(ctx.seed);
@@ -254,22 +255,56 @@ pub fn rank(ctx: &RankContext, candidates: Vec<VideoSummary>) -> Vec<VideoSummar
     .collect()
 }
 
-/// `ranked` with its places shared between the viewer's lasting interests, so the strongest one
-/// does not fill every page.
+/// The viewer's interests grouped into clusters, as discovery and Home's share read them.
 #[must_use]
-pub fn share_by_interest(ctx: &RankContext, ranked: Vec<VideoSummary>) -> Vec<VideoSummary> {
+pub fn clusters_of(ctx: &RankContext) -> Vec<TopicCluster> {
     let brain = ctx.brain;
     let interests: HashMap<String, f64> = brain
         .interests()
         .map(|(key, weight)| (key.clone(), weight))
         .collect();
-    let clusters = build_clusters(&ClusterInputs {
+    build_clusters(&ClusterInputs {
         topic_scores: &interests,
         affinities: &brain.topic_affinities,
         channel_topic_profiles: &brain.channel_topic_profiles,
         channel_edges: ctx.channel_edges,
         spec: &brain.key_spec(),
-    });
+    })
+}
+
+/// The videos whose topics include one of `topics`.
+#[must_use]
+pub fn about(
+    ctx: &RankContext,
+    videos: Vec<VideoSummary>,
+    topics: &HashSet<String>,
+) -> Vec<VideoSummary> {
+    let brain = ctx.brain;
+    let idf = IdfSnapshot {
+        word_frequencies: brain.idf_word_frequency.clone(),
+        total_documents: brain.idf_total_documents,
+    };
+    let reader = TopicReader {
+        spec: brain.key_spec(),
+        idf: &idf,
+    };
+    videos
+        .into_iter()
+        .filter(|video| {
+            vector_of(ctx, video, &reader)
+                .topics
+                .keys()
+                .any(|topic| topics.contains(topic))
+        })
+        .collect()
+}
+
+/// `ranked` with its places shared between the viewer's lasting interests, so the strongest one
+/// does not fill every page.
+#[must_use]
+pub fn share_by_interest(ctx: &RankContext, ranked: Vec<VideoSummary>) -> Vec<VideoSummary> {
+    let brain = ctx.brain;
+    let clusters = clusters_of(ctx);
     let weights = interest_share::weights(&clusters);
     if weights.len() < 2 {
         return ranked;
@@ -352,7 +387,7 @@ fn vector_of(ctx: &RankContext, video: &VideoSummary, reader: &TopicReader) -> C
             description: None,
             duration_seconds: video.duration_seconds,
             is_live: video.is_live,
-            is_short: is_known_short(video.duration_seconds),
+            is_short: ctx.shorts_feed || is_known_short(video.duration_seconds),
         },
         reader,
         ctx.brain.channel_topic_profiles.get(channel_of(video)),
@@ -363,7 +398,11 @@ fn vector_of(ctx: &RankContext, video: &VideoSummary, reader: &TopicReader) -> C
     vector
 }
 
-fn candidate<'a>(video: &'a VideoSummary, vector: &'a ContentVector) -> Candidate<'a> {
+fn candidate<'a>(
+    ctx: &RankContext,
+    video: &'a VideoSummary,
+    vector: &'a ContentVector,
+) -> Candidate<'a> {
     Candidate {
         video_id: &video.id,
         channel_id: channel_of(video),
@@ -374,7 +413,7 @@ fn candidate<'a>(video: &'a VideoSummary, vector: &'a ContentVector) -> Candidat
         like_count: 0,
         category: None,
         is_live: video.is_live,
-        is_short: is_known_short(video.duration_seconds),
+        is_short: ctx.shorts_feed || is_known_short(video.duration_seconds),
     }
 }
 
@@ -422,7 +461,7 @@ mod tests {
             user_subs: subs,
             now_ms: 1_800_000_000_000,
             min_relevance,
-            keep_suppressed_channels: false,
+            shorts_feed: false,
             session: SessionState {
                 topics: &[],
                 video_count: 0,

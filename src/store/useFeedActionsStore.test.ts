@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const api = vi.hoisted(() => ({
   markNotInterested: vi.fn(),
   blockChannel: vi.fn(),
+  unblockChannel: vi.fn(),
   logInteraction: vi.fn(),
 }));
 vi.mock("../lib/api/recommendation", () => api);
@@ -63,6 +64,24 @@ describe("feed actions", () => {
     });
     api.markNotInterested.mockReset().mockResolvedValue(undefined);
     api.blockChannel.mockReset().mockResolvedValue(undefined);
+    api.unblockChannel.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("lets an unblocked channel back into the feeds", async () => {
+    await useFeedActionsStore.getState().blockChannel(card("a"));
+    await useFeedActionsStore.getState().notInterested(card("b"));
+    await useFeedActionsStore.getState().unblockChannel("UC1");
+    const state = useFeedActionsStore.getState();
+    expect(state.blockedChannelIds.has("UC1")).toBe(false);
+    expect(state.suppressedChannelIds.has("UC1")).toBe(false);
+    expect(api.unblockChannel).toHaveBeenCalledWith("UC1");
+  });
+
+  it("keeps a channel hidden when the backend cannot unblock it", async () => {
+    await useFeedActionsStore.getState().blockChannel(card("a"));
+    api.unblockChannel.mockRejectedValue(new Error("db"));
+    await expect(useFeedActionsStore.getState().unblockChannel("UC1")).rejects.toThrow("db");
+    expect(useFeedActionsStore.getState().blockedChannelIds.has("UC1")).toBe(true);
   });
 
   it("never turns a second not interested into a channel block", async () => {
@@ -82,6 +101,11 @@ describe("feed actions", () => {
     const state = useFeedActionsStore.getState();
     expect(state.dismissedVideoIds.size).toBe(0);
     expect(state.suppressedChannelIds.size).toBe(0);
+  });
+
+  it("keeps the channel's name with the block", async () => {
+    await useFeedActionsStore.getState().blockChannel(card("a"));
+    expect(api.blockChannel).toHaveBeenCalledWith("UC1", "Chan");
   });
 
   it("rolls a channel block back when the backend fails", async () => {

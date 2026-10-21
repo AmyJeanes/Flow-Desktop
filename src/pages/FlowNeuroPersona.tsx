@@ -1,12 +1,12 @@
 import {
   unblockTopic,
-  unblockChannel,
   resetBrain,
   importBrain,
   type UserBrain,
 } from "../lib/api/recommendation";
 import { usePersonaData } from "../lib/usePersonaData";
 import { clearHomeFeed } from "../lib/api/homeFeed";
+import { useFeedActionsStore } from "../store/useFeedActionsStore";
 
 import { SkeletonLoader } from "../components/persona/SkeletonLoader";
 import { PersonaOverview } from "../components/persona/PersonaOverview";
@@ -41,7 +41,7 @@ export function FlowNeuroPersona() {
 
   const handleUnblockChannel = async (channelId: string) => {
     try {
-      await unblockChannel(channelId);
+      await useFeedActionsStore.getState().unblockChannel(channelId);
       await refresh(true);
     } catch (e) {
       console.error("Failed to unblock channel:", e);
@@ -76,7 +76,7 @@ export function FlowNeuroPersona() {
           <div className="col-span-12 flex items-center justify-between">
             <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-on-surface)] flex items-center gap-3">
               <BrainCog className="h-7 w-7 text-[var(--color-primary)] animate-pulse" />
-               Control Center
+               {getString("persona_title")}
             </h1>
           </div>
           <div className="col-span-12">
@@ -120,10 +120,10 @@ export function FlowNeuroPersona() {
         <div className="col-span-12 flex items-center justify-between gap-4 border-b border-[var(--color-outline-variant)] pb-4">
           <div>
             <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-on-surface)] flex items-center gap-3">
-              Control Center
+              {getString("persona_title")}
             </h1>
             <p className="text-sm text-[var(--color-on-surface-variant)] mt-1">
-              Analyze and manage local recommendation signals, memory, and sync controls.
+              {getString("persona_subtitle")}
             </p>
           </div>
 
@@ -133,7 +133,7 @@ export function FlowNeuroPersona() {
             className="flex items-center gap-2 bg-[var(--color-surface-container-high)] hover:bg-[var(--color-surface-container-highest)] disabled:opacity-50 text-[var(--color-on-surface)] py-2.5 px-4 rounded-full text-xs font-semibold border border-[var(--color-outline-variant)] transition-colors active:scale-95 cursor-pointer shrink-0"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin text-[var(--color-primary)]" : ""}`} />
-            {refreshing ? "Refreshing..." : "Sync"}
+            {getString(refreshing ? "persona_refreshing" : "persona_sync")}
           </button>
         </div>
 

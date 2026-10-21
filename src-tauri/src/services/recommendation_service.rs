@@ -21,8 +21,8 @@ use crate::flow_neuro::learning::{Interaction, apply_interaction};
 use crate::flow_neuro::rank::{RankContext, SessionState, rank};
 use crate::flow_neuro::ranker::MomentumEntry;
 use crate::flow_neuro::scoring::{
-    FEED_HISTORY_EXPIRY_DAYS, FEED_HISTORY_MAX, FeedEntry, FlowPersona, IMPRESSION_CACHE_MAX,
-    SESSION_TOPIC_HISTORY_MAX, TimeBucket, UserBrain, classify_persona, is_known_short,
+    FeedEntry, FlowPersona, IMPRESSION_CACHE_MAX, SESSION_TOPIC_HISTORY_MAX, TimeBucket, UserBrain,
+    classify_persona, is_known_short,
 };
 use crate::flow_neuro::search_learning::learn_search;
 use crate::flow_neuro::side_stores::SideStores;
@@ -120,6 +120,11 @@ impl RecommendationService {
     }
 
     /// Reload the resident brain from the database after a sync merge wrote it directly.
+    /// Saves the brain and holds saves until [`Self::reload_brain`], around a sync merge.
+    pub async fn flush_and_hold_brain(&self) -> AppResult<()> {
+        self.brain_store.flush_and_hold().await
+    }
+
     pub async fn reload_brain(&self) -> AppResult<()> {
         self.brain_store.reload().await
     }
@@ -264,8 +269,8 @@ impl RecommendationService {
             .await
     }
 
-    /// Shorts ranking: keeps taste ordering and explicit blocks, but skips channel-
-    /// level suppression so the high-volume feed isn't starved
+    /// Shorts ranking: against the Shorts taste, with Shorts seen this week held back and
+    /// channel-level suppression skipped so the high-volume feed isn't starved.
     pub async fn rank_shorts_candidates(
         &self,
         candidates: Vec<VideoSummary>,
@@ -296,13 +301,13 @@ impl RecommendationService {
         candidates: Vec<VideoSummary>,
         user_subs: HashSet<String>,
         min_relevance: f64,
-        lenient: bool,
+        shorts_feed: bool,
     ) -> AppResult<Vec<VideoSummary>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
         Ok(self
-            .with_rank_context(&user_subs, min_relevance, lenient, |ctx| {
+            .with_rank_context(&user_subs, min_relevance, shorts_feed, |ctx| {
                 rank(ctx, candidates)
             })
             .await)
@@ -313,7 +318,7 @@ impl RecommendationService {
         &self,
         user_subs: &HashSet<String>,
         min_relevance: f64,
-        lenient: bool,
+        shorts_feed: bool,
         f: impl FnOnce(&RankContext) -> R,
     ) -> R {
         self.reset_idle_session();
@@ -332,7 +337,7 @@ impl RecommendationService {
             user_subs,
             now_ms,
             min_relevance,
-            keep_suppressed_channels: lenient,
+            shorts_feed,
             session: SessionState {
                 topics: &session_topics,
                 video_count: session_video_count,
@@ -641,7 +646,11 @@ impl RecommendationService {
             }
 
             if cache.len() > IMPRESSION_CACHE_MAX {
-                if let Some(oldest_key) = cache.keys().next().cloned() {
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, (_, shown_at))| *shown_at)
+                    .map(|(id, _)| id.clone())
+                {
                     cache.remove(&oldest_key);
                 }
             }
@@ -660,26 +669,7 @@ impl RecommendationService {
             entry.show_count += 1;
         }
 
-        let feed_cutoff = now_ms.saturating_sub(FEED_HISTORY_EXPIRY_DAYS * 86_400_000);
-        brain
-            .feed_history
-            .retain(|_, entry| entry.last_shown >= feed_cutoff);
-        if brain.feed_history.len() > FEED_HISTORY_MAX {
-            let mut entries: Vec<(String, FeedEntry)> = brain
-                .feed_history
-                .iter()
-                .map(|(video_id, entry)| (video_id.clone(), entry.clone()))
-                .collect();
-            entries.sort_by(|a, b| b.1.last_shown.cmp(&a.1.last_shown));
-            let retained: HashSet<String> = entries
-                .into_iter()
-                .take(FEED_HISTORY_MAX)
-                .map(|(video_id, _)| video_id)
-                .collect();
-            brain
-                .feed_history
-                .retain(|video_id, _| retained.contains(video_id));
-        }
+        crate::flow_neuro::caps::prune_feed_history(&mut brain, now_ms);
 
         Ok(())
     }

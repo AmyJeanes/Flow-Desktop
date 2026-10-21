@@ -79,12 +79,15 @@ use commands::pip::{
 use commands::recommendation::{
     add_blocked_topic, add_preferred_topic, block_channel, bootstrap_from_history,
     bootstrap_from_subscriptions, complete_onboarding, end_watch_session, get_brain_snapshot,
-    get_flow_persona, get_onboarding_status, get_recommendation_events, import_brain,
-    learn_from_search, log_interaction, mark_not_interested, note_subscription,
+    get_flow_persona, get_onboarding_status, get_recommendation_events, get_taste_overview,
+    import_brain, learn_from_search, log_interaction, mark_not_interested, note_subscription,
     observe_channel_uploads, record_feed_impressions, remove_preferred_topic,
-    report_watch_progress, reset_brain, unblock_channel, unblock_topic,
+    report_watch_progress, reset_brain, resolve_hidden_channel_names, unblock_channel,
+    unblock_topic,
 };
-use commands::shorts::{get_shorts_feed, load_more_shorts, reset_shorts_feed};
+use commands::shorts::{
+    get_shorts_feed, load_more_shorts, record_seen_shorts, report_short_view, reset_shorts_feed,
+};
 use commands::sync::{
     sync_cancel, sync_device_info, sync_host_receive, sync_respond_consent, sync_scan_join,
     sync_start_host, sync_status,
@@ -369,6 +372,7 @@ pub fn run() {
 
             // Manage the Shorts feed service (prefetch buffer + session de-dup)
             app.manage(ShortsService::new());
+            app.manage(services::blocked_channel_names::BlockedChannelNames::default());
             app.manage(services::home_feed::HomeFeedService::new());
             app.manage(DownloadManager::default());
             app.manage(PlayerFullscreenState::default());
@@ -501,10 +505,13 @@ pub fn run() {
             commands::home_feed::home_feed_visible,
             commands::home_feed::home_feed_retry_more,
             commands::home_feed::home_feed_clear,
+            commands::home_feed::home_feed_chips,
+            commands::home_feed::home_chip_feed,
             complete_onboarding,
             get_onboarding_status,
             get_flow_persona,
             get_brain_snapshot,
+            get_taste_overview,
             get_recommendation_events,
             unblock_topic,
             add_blocked_topic,
@@ -512,6 +519,7 @@ pub fn run() {
             remove_preferred_topic,
             unblock_channel,
             block_channel,
+            resolve_hidden_channel_names,
             reset_brain,
             get_sponsorblock_segments,
             submit_sponsorblock_segment,
@@ -550,6 +558,8 @@ pub fn run() {
             get_shorts_feed,
             load_more_shorts,
             reset_shorts_feed,
+            report_short_view,
+            record_seen_shorts,
             // --- YouTube Music subsystem (additive) ---
             get_music_home_page,
             get_cached_music_home_page,
