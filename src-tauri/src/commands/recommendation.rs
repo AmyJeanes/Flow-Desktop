@@ -5,10 +5,13 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::errors::ErrorResponse;
 use crate::flow_neuro::bootstrap::ImportedVideo;
+use crate::flow_neuro::gates::LANE_RELEVANCE_FLOOR;
 use crate::flow_neuro::signals::InteractionType;
 use crate::flow_neuro::watch_session::{END_GRACE_SECONDS, WatchReport};
 use crate::models::video::VideoSummary;
-use crate::services::recommendation_service::{FeedQuotas, RecommendationService};
+use crate::services::recommendation_service::{
+    DiscoverySurface, FeedQuotas, RecommendationService,
+};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,11 +26,17 @@ pub struct PersonaDetails {
 pub async fn rank_videos(
     candidates: Vec<VideoSummary>,
     user_subs: Vec<String>,
+    relevant_only: Option<bool>,
     recommendation_service: State<'_, RecommendationService>,
 ) -> Result<Vec<VideoSummary>, ErrorResponse> {
     let subs_set = user_subs.into_iter().collect::<HashSet<String>>();
+    let min_relevance = if relevant_only.unwrap_or(false) {
+        LANE_RELEVANCE_FLOOR
+    } else {
+        0.0
+    };
     recommendation_service
-        .rank_candidates(candidates, subs_set)
+        .rank_candidates(candidates, subs_set, min_relevance)
         .await
         .map_err(ErrorResponse::from)
 }
@@ -72,6 +81,7 @@ pub async fn log_interaction(
             is_short,
             interaction,
             percent_watched,
+            None,
         )
         .await
         .map_err(ErrorResponse::from)
@@ -135,6 +145,7 @@ pub async fn mark_not_interested(
             is_short,
             InteractionType::NotInterested,
             0.0,
+            None,
         )
         .await
         .map_err(ErrorResponse::from)
@@ -174,12 +185,25 @@ pub async fn get_onboarding_status(
 
 #[tauri::command]
 pub async fn generate_discovery_queries(
+    reset_depth: Option<bool>,
     recommendation_service: State<'_, RecommendationService>,
 ) -> Result<Vec<String>, ErrorResponse> {
     recommendation_service
-        .generate_discovery_queries()
+        .generate_discovery_queries(DiscoverySurface::Home, reset_depth.unwrap_or(false))
         .await
         .map_err(ErrorResponse::from)
+}
+
+#[tauri::command]
+pub async fn report_discovery_results(
+    query: String,
+    video_ids: Vec<String>,
+    recommendation_service: State<'_, RecommendationService>,
+) -> Result<(), ErrorResponse> {
+    recommendation_service
+        .report_discovery_results(&query, &video_ids)
+        .await;
+    Ok(())
 }
 
 #[tauri::command]

@@ -82,8 +82,8 @@ use commands::recommendation::{
     generate_discovery_queries, get_brain_snapshot, get_feed_quotas, get_flow_persona,
     get_onboarding_status, get_recommendation_events, import_brain, learn_from_search,
     log_interaction, mark_not_interested, note_subscription, observe_channel_uploads, rank_videos,
-    record_feed_impressions, remove_preferred_topic, report_watch_progress, reset_brain,
-    unblock_channel, unblock_topic,
+    record_feed_impressions, remove_preferred_topic, report_discovery_results,
+    report_watch_progress, reset_brain, unblock_channel, unblock_topic,
 };
 use commands::shorts::{get_shorts_feed, load_more_shorts, reset_shorts_feed};
 use commands::sync::{
@@ -337,8 +337,22 @@ pub fn run() {
                 ))
             })?;
 
+            let neuro_stores = tauri::async_runtime::block_on(async {
+                flow_neuro::side_stores::SideStores::load(pool.clone()).await
+            })
+            .map_err(|error| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    error.to_string(),
+                ))
+            })?;
+
             // Initialize and manage recommendation service
-            let rec_service = RecommendationService::new(pool.clone(), brain_store);
+            let rec_service = RecommendationService::new(
+                pool.clone(),
+                brain_store,
+                std::sync::Arc::new(neuro_stores),
+            );
             app.manage(rec_service);
 
             let music_brain_store = tauri::async_runtime::block_on(async {
@@ -485,6 +499,7 @@ pub fn run() {
             complete_onboarding,
             get_onboarding_status,
             generate_discovery_queries,
+            report_discovery_results,
             get_flow_persona,
             get_brain_snapshot,
             get_feed_quotas,

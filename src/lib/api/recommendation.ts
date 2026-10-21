@@ -42,15 +42,20 @@ const MOCK_FEED_QUOTAS: FeedQuotas = {
   viralLimit: 10,
 };
 
+/**
+ * Ranks feed candidates. A lane that must stay on the viewer's subjects (discovery, related)
+ * passes `relevantOnly`, which leaves out what shares next to nothing with their interests.
+ */
 export async function rankVideos(
   candidates: VideoSummary[],
   userSubs: string[],
+  relevantOnly = false,
 ): Promise<VideoSummary[]> {
   if (!(await isTauriEnv())) {
     console.warn("Tauri not detected. Returning candidates with mock ranking.");
     return [...candidates].sort(() => 0.5 - Math.random());
   }
-  return invokeBackend<VideoSummary[]>("rank_videos", { candidates, userSubs });
+  return invokeBackend<VideoSummary[]>("rank_videos", { candidates, userSubs, relevantOnly });
 }
 
 export async function getFeedQuotas(): Promise<FeedQuotas> {
@@ -118,6 +123,7 @@ export interface WatchReport {
   description: string | null;
   isLive: boolean;
   isMusic: boolean;
+  category: string | null;
   position: number;
   duration: number;
   playedDelta: number;
@@ -193,7 +199,11 @@ export async function getOnboardingStatus(): Promise<boolean> {
   return invokeBackend<boolean>("get_onboarding_status");
 }
 
-export async function generateDiscoveryQueries(): Promise<string[]> {
+/**
+ * Home's discovery searches. A refresh passes `resetDepth`; each load-more call after it digs one
+ * level deeper into every interest.
+ */
+export async function generateDiscoveryQueries(resetDepth = false): Promise<string[]> {
   if (!(await isTauriEnv())) {
     const preferred = localStorage.getItem("mock_setting_preferred_topics");
     const topics: string[] = preferred ? JSON.parse(preferred) : [];
@@ -202,7 +212,13 @@ export async function generateDiscoveryQueries(): Promise<string[]> {
     }
     return ["technology", "music", "gaming", "science", "documentary"];
   }
-  return invokeBackend<string[]>("generate_discovery_queries");
+  return invokeBackend<string[]>("generate_discovery_queries", { resetDepth });
+}
+
+/** Tells the engine what a discovery search returned, so one that keeps returning shown videos rests. */
+export async function reportDiscoveryResults(query: string, videoIds: string[]): Promise<void> {
+  if (!(await isTauriEnv())) return;
+  await invokeBackend<void>("report_discovery_results", { query, videoIds });
 }
 
 export async function getFlowPersona(): Promise<PersonaDetails> {
