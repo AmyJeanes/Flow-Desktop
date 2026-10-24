@@ -165,6 +165,8 @@ export interface VideoStream {
   loadingStream: boolean;
   streamError: string | null;
   streamErrorKind: string | null;
+  /** When an upcoming premiere or stream starts, in epoch milliseconds. */
+  streamStartsAtMs: number | null;
   setResumeTime: (time: number) => void;
   onSelectQuality: (variant: StreamVariant | "auto") => void;
   onRetrySource: (reason: string) => void;
@@ -193,9 +195,13 @@ export function useVideoStream(videoId: string | undefined): VideoStream {
   const [sourceMode, setSourceMode] = useState<SourceMode>("unavailable");
   const [selectedQualityId, setSelectedQualityId] = useState<string>("auto");
   const [resumeTime, setResumeTime] = useState(0);
+  // The video whose links were already re-resolved once without asking.
+  const autoRecoveredRef = useRef<string | null>(null);
+  const hardRetryRef = useRef<() => void>(() => undefined);
   const [loadingStream, setLoadingStream] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [streamErrorKind, setStreamErrorKind] = useState<string | null>(null);
+  const [streamStartsAtMs, setStreamStartsAtMs] = useState<number | null>(null);
 
   const streamInfoRef = useRef<StreamInfo | null>(null);
   const attemptedModesRef = useRef<Set<SourceMode>>(new Set());
@@ -368,6 +374,7 @@ export function useVideoStream(videoId: string | undefined): VideoStream {
         const info = classifyPlayerError(err);
         setStreamError(info.rawMessage);
         setStreamErrorKind(info.kind);
+        setStreamStartsAtMs(info.startsAtMs ?? null);
         recordPlayerEvent(`video resolve failed: ${info.kind} (${info.rawMessage})`);
         console.error("Failed to load stream URL", err);
       } finally {
@@ -419,6 +426,17 @@ export function useVideoStream(videoId: string | undefined): VideoStream {
 
       attemptedModesRef.current.add(sourceMode);
       const next = available.find((mode) => !attemptedModesRef.current.has(mode));
+
+      // A source that played and then stopped was most likely refused or its
+      // link expired; another source mode built from the same links fails the
+      // same way, so walk a fresh ladder once, resuming here, before switching.
+      const videoId = usePlayerStore.getState().currentVideo?.id;
+      if (videoId && autoRecoveredRef.current !== videoId && (resumeAt > 0 || !next) && !info.isLive) {
+        autoRecoveredRef.current = videoId;
+        recordPlayerEvent(`video auto re-resolve after ${reason} at ${Math.round(resumeAt)}s`);
+        hardRetryRef.current();
+        return;
+      }
       console.warn("[Watch] source-mode fallback", { reason, from: sourceMode, next, available });
       recordPlayerEvent(`video source fallback: ${reason} from=${sourceMode} next=${next ?? "none"}`);
 
@@ -468,6 +486,7 @@ export function useVideoStream(videoId: string | undefined): VideoStream {
 
   const onHardRetry = useCallback(() => {
     if (!currentVideo) return;
+    const resumeAt = streamInfoRef.current?.isLive ? 0 : usePlayerStore.getState().currentTime || 0;
     setStreamUrl(null);
     setStreamVariants([]);
     publishCaptions([]);
@@ -499,6 +518,7 @@ export function useVideoStream(videoId: string | undefined): VideoStream {
         setSelectedQualityId(initialQualityId);
         setStreamError(null);
         setStreamErrorKind(null);
+        setResumeTime(resumeAt);
 
         const mode = computeAvailableSourceModes(info)[0] || "unavailable";
         attemptedModesRef.current.add(mode);
@@ -525,9 +545,11 @@ export function useVideoStream(videoId: string | undefined): VideoStream {
         const info = classifyPlayerError(err);
         setStreamError(info.rawMessage);
         setStreamErrorKind(info.kind);
+        setStreamStartsAtMs(info.startsAtMs ?? null);
         recordPlayerEvent(`video hard retry failed: ${info.kind} (${info.rawMessage})`);
       });
   }, [currentVideo, preferredCodec, preferredQuality, publishCaptions]);
+  hardRetryRef.current = onHardRetry;
 
   return {
     streamUrl,
@@ -543,6 +565,7 @@ export function useVideoStream(videoId: string | undefined): VideoStream {
     loadingStream,
     streamError,
     streamErrorKind,
+    streamStartsAtMs,
     setResumeTime,
     onSelectQuality,
     onRetrySource,

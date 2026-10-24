@@ -103,6 +103,18 @@ fn user_agent_for_media_url(url: &str, session_user_agent: &str) -> String {
         )
 }
 
+/// How long a session lives when its URL names no expiry, as a generated manifest
+/// or an image does: as long as a googlevideo URL's own six hours.
+const UNDATED_SESSION_SECS: u64 = 6 * 3600;
+
+/// A remote session lives as long as its URL does. A fixed hour cut every video
+/// still playing an hour after it resolved off mid-stream.
+fn remote_session_expiry(remote_url: &str, now: u64) -> u64 {
+    crate::api::innertube::core::gate_tracker::url_expiry_secs(remote_url)
+        .filter(|expire| *expire > now)
+        .unwrap_or(now + UNDATED_SESSION_SECS)
+}
+
 impl StreamingManager {
     pub fn new() -> (Self, ProxyListeners) {
         let bind =
@@ -160,9 +172,9 @@ impl StreamingManager {
             .unwrap()
             .as_secs();
         let session = StreamSession {
+            expires_at: remote_session_expiry(&remote_url, now),
             kind: StreamSessionKind::Remote { remote_url },
             content_type,
-            expires_at: now + 3600,
             user_agent,
         };
         let mut lock = self.sessions.lock().unwrap();
@@ -178,7 +190,7 @@ impl StreamingManager {
         let session = StreamSession {
             kind: StreamSessionKind::Inline { body },
             content_type,
-            expires_at: now + 3600,
+            expires_at: now + UNDATED_SESSION_SECS,
             user_agent: String::new(),
         };
         let mut lock = self.sessions.lock().unwrap();
@@ -508,39 +520,6 @@ async fn handle_connection(
         }
         return write_full_body(&mut socket, "text/plain", "no-store", b"ok", head_only).await;
     }
-    // In-page WebView player-response exfil (see webview_player). The youtube.com
-    // page POSTs its ytInitialPlayerResponse here (its CSP has no connect-src, so
-    // a cross-origin fetch to the loopback proxy is allowed).
-    if path == "/ytresult" {
-        let id = request_url
-            .query_pairs()
-            .find(|(key, _)| key == "id")
-            .map(|(_, value)| value.into_owned());
-        let want = head.content_length.unwrap_or(0);
-        let mut body = body_prefix;
-        while body.len() < want {
-            let mut tmp = [0u8; 16384];
-            let n = socket.read(&mut tmp).await.unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&tmp[..n]);
-        }
-        if let Some(id) = id {
-            crate::api::innertube::core::webview_player::resolve(
-                &id,
-                &String::from_utf8_lossy(&body),
-            );
-        }
-        return write_full_body(&mut socket, "text/plain", "no-store", b"ok", head_only).await;
-    }
-    if path == "/ytdiag" {
-        if let Some((_, msg)) = request_url.query_pairs().find(|(key, _)| key == "msg") {
-            info!(msg = %msg, "yt extract diag");
-        }
-        return write_full_body(&mut socket, "text/plain", "no-store", b"ok", head_only).await;
-    }
-
     if path.starts_with("/sabr/") {
         return handle_sabr_route(&mut socket, &manager, &path, head_only).await;
     }
@@ -770,6 +749,19 @@ async fn relay_local_file(
     Ok(())
 }
 
+/// For testing recovery: with `FLOW_DEBUG_REFUSE_AFTER_BYTES=N` set, media past
+/// byte N is refused as googlevideo refuses a walled client.
+fn debug_refusal_due(offset: u64) -> bool {
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    AFTER
+        .get_or_init(|| {
+            std::env::var("FLOW_DEBUG_REFUSE_AFTER_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .is_some_and(|after| offset >= after)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn relay_remote(
     socket: &mut TcpStream,
@@ -830,10 +822,20 @@ async fn relay_remote(
         let is_image = session.content_type.starts_with("image/");
         let stall_guarded = session.content_type.starts_with("video/")
             || session.content_type.starts_with("audio/");
+        // Media ranges must arrive byte-exact, but manifests and captions are text
+        // a live stream refetches every few seconds: a live playlist is about
+        // 880 KB as text and 12 KB compressed.
+        let ct_session = session.content_type.to_ascii_lowercase();
+        let compressible = ct_session.contains("mpegurl")
+            || ct_session.contains("dash+xml")
+            || ct_session.contains("text/vtt");
         let mut req = client
             .get(target_url)
             .header("User-Agent", &upstream_user_agent)
-            .header("Accept-Encoding", "identity");
+            .header(
+                "Accept-Encoding",
+                if compressible { "gzip, br" } else { "identity" },
+            );
         if is_image {
             req = req
                 .header(
@@ -855,6 +857,15 @@ async fn relay_remote(
         } else {
             None
         };
+
+        if stall_guarded && debug_refusal_due(effective_start) {
+            warn!(
+                effective_start,
+                "FLOW_DEBUG_REFUSE_AFTER_BYTES: refusing the relay"
+            );
+            crate::api::innertube::core::gate_tracker::record_refused_url(target_url);
+            return write_status_only(socket, 403, "Forbidden", "Refused for testing").await;
+        }
 
         let response = match req.send().await {
             Ok(res) => res,
@@ -917,6 +928,9 @@ async fn relay_remote(
                     ua = %upstream_user_agent,
                     "Upstream rejected stream relay"
                 );
+                if stall_guarded && matches!(status.as_u16(), 401 | 403) {
+                    crate::api::innertube::core::gate_tracker::record_refused_url(target_url);
+                }
             }
             let headers = response.headers();
             content_type_value = headers
