@@ -39,7 +39,8 @@ use commands::db::{
 };
 use commands::diagnostics::{
     clear_logs, get_graphics_mode, log_frontend_event, logs_dir_path, read_logs,
-    reveal_logs_folder, set_graphics_mode, startup_render_ok, updates_supported,
+    reset_visitor_identity, reveal_logs_folder, set_graphics_mode, startup_render_ok,
+    updates_supported,
 };
 use commands::discord::{clear_discord_presence, set_discord_presence};
 use commands::downloads::{
@@ -286,9 +287,11 @@ pub fn run() {
 
             // Initialize native Innertube extractor (shared by the video path and
             // the additive YouTube Music subsystem).
-            let extractor = Arc::new(InnertubeClient::new(app.handle()));
+            let extractor = Arc::new(InnertubeClient::new());
+            extractor.keep_identity_in(app_data_dir.join("visitor_identity.json"));
             let youtube_service = YoutubeService::new(extractor.clone());
             app.manage(youtube_service);
+            app.manage(extractor.clone());
 
             // The first video otherwise waits on both: the visitor identity every
             // player request carries, and the player script web clients need.
@@ -543,6 +546,7 @@ pub fn run() {
             clear_logs,
             logs_dir_path,
             reveal_logs_folder,
+            reset_visitor_identity,
             startup_render_ok,
             get_graphics_mode,
             set_graphics_mode,
