@@ -269,7 +269,7 @@ pub fn run() {
 
             // Let the BotGuard minter open a hidden WebView for a real-browser
             // poToken (falls back to the headless Node sidecar without this).
-            api::innertube::core::webview_pot::set_app_handle(app.handle().clone());
+            api::innertube::core::hidden_webview::set_app_handle(app.handle().clone());
 
             // Linux bundles keep the Node sidecar scripts in the resource dir.
             if let Ok(dir) = app.path().resource_dir() {
@@ -309,6 +309,18 @@ pub fn run() {
                     error.to_string(),
                 ))
             })?;
+
+            let remote_decoder_setting = tauri::async_runtime::block_on(db::settings::get_setting(
+                &pool,
+                api::innertube::core::remote_decoder::SETTING_KEY,
+            ))
+            .ok()
+            .flatten();
+            api::innertube::core::remote_decoder::set_enabled(
+                api::innertube::core::remote_decoder::enabled_from_setting(
+                    remote_decoder_setting.as_deref(),
+                ),
+            );
 
             // Manage database pool
             app.manage(pool.clone());
