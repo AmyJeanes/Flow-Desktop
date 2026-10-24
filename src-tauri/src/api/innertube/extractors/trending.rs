@@ -2,11 +2,9 @@ use std::collections::HashSet;
 
 use crate::api::innertube::InnertubeClient;
 use crate::api::innertube::core::clients;
-use crate::api::innertube::core::utils::{
-    best_video_thumbnail_url, build_related_content_from_lockup, detect_video_is_live,
-    extract_channel_id_from_video_renderer, extract_text_from_value, normalize_youtube_image_url,
-    parse_duration_seconds, thumbnail_url_from_array,
-};
+use crate::api::innertube::json::thumbnail::thumbnail_url_from_array;
+use crate::api::innertube::renderers::lockup::lockup_item;
+use crate::api::innertube::renderers::video::video_from_renderer;
 use crate::errors::{AppError, AppResult};
 use crate::models::video::VideoSummary;
 use serde_json::{Value, json};
@@ -194,14 +192,14 @@ fn collect_videos_from_value(value: &Value, videos: &mut Vec<VideoSummary>) {
         .get("videoRenderer")
         .or_else(|| value.get("gridVideoRenderer"))
     {
-        if let Some(summary) = parse_video_renderer(video) {
+        if let Some(summary) = video_from_renderer(video) {
             videos.push(summary);
         }
         return;
     }
 
     if let Some(lockup) = value.get("lockupViewModel") {
-        if let Some(item) = build_related_content_from_lockup(lockup) {
+        if let Some(item) = lockup_item(lockup) {
             if item.item_type == "video" {
                 videos.push(VideoSummary {
                     id: item.video_id.unwrap_or(item.id),
@@ -214,6 +212,7 @@ fn collect_videos_from_value(value: &Value, videos: &mut Vec<VideoSummary>) {
                     view_count_text: item.view_count_text,
                     channel_avatar_url: None,
                     is_live: item.is_live,
+                    ..Default::default()
                 });
             }
         }
@@ -232,59 +231,6 @@ fn collect_videos_from_value(value: &Value, videos: &mut Vec<VideoSummary>) {
             collect_videos_from_value(child, videos);
         }
     }
-}
-
-fn parse_video_renderer(video: &Value) -> Option<VideoSummary> {
-    let id = video["videoId"]
-        .as_str()
-        .or_else(|| video["videoId"]["runs"][0]["text"].as_str())?
-        .to_string();
-
-    let title = extract_text_from_value(&video["title"])
-        .or_else(|| {
-            video["title"]["runs"][0]["text"]
-                .as_str()
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_default();
-
-    if title.is_empty() {
-        return None;
-    }
-
-    let channel_name = extract_text_from_value(&video["ownerText"])
-        .or_else(|| extract_text_from_value(&video["longBylineText"]))
-        .or_else(|| extract_text_from_value(&video["shortBylineText"]))
-        .unwrap_or_default();
-
-    let duration_text = extract_text_from_value(&video["lengthText"]);
-    let duration_seconds = duration_text
-        .as_deref()
-        .filter(|text| !text.is_empty())
-        .map(parse_duration_seconds);
-
-    let thumbnail_url = best_video_thumbnail_url(&id, Some(&video["thumbnail"]["thumbnails"]));
-
-    let channel_avatar_url = video["channelThumbnailSupportedRenderers"]
-        ["channelThumbnailWithLinkRenderer"]["thumbnail"]["thumbnails"]
-        .as_array()
-        .and_then(|items| items.last())
-        .and_then(|thumb| thumb["url"].as_str())
-        .map(normalize_youtube_image_url);
-
-    Some(VideoSummary {
-        id,
-        title,
-        channel_name,
-        channel_id: extract_channel_id_from_video_renderer(video),
-        thumbnail_url,
-        duration_seconds,
-        published_text: extract_text_from_value(&video["publishedTimeText"]),
-        view_count_text: extract_text_from_value(&video["viewCountText"])
-            .or_else(|| extract_text_from_value(&video["shortViewCountText"])),
-        channel_avatar_url,
-        is_live: detect_video_is_live(video),
-    })
 }
 
 fn parse_charts_videos(response: &Value) -> Vec<VideoSummary> {
@@ -346,6 +292,7 @@ fn parse_chart_video(video: &Value) -> Option<VideoSummary> {
         view_count_text: None,
         channel_avatar_url: None,
         is_live: false,
+        ..Default::default()
     })
 }
 

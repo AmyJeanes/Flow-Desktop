@@ -5,12 +5,9 @@ use crate::api::innertube::core::clients;
 use crate::errors::ErrorResponse;
 use crate::models::channel::{ChannelDetails, ChannelTabResponse};
 use crate::models::comment::CommentsResponse;
-use crate::models::music::{ArtistPage, ChartsPage, ExplorePage};
 use crate::models::playlist::PlaylistDetailsResponse;
 use crate::models::search::{SearchVideosRequest, SearchVideosResponse};
-use crate::models::video::{
-    MusicHomeChip, MusicHomeSection, RelatedContentItem, StreamInfo, VideoDetails, VideoSummary,
-};
+use crate::models::video::{RelatedContentItem, StreamInfo, VideoDetails, VideoSummary};
 use crate::security::validation::{
     validate_browse_id, validate_channel_id, validate_page_token, validate_search_query,
     validate_video_id,
@@ -141,6 +138,7 @@ pub(crate) fn parse_rss_feed(
                     view_count_text: None,
                     channel_avatar_url: None,
                     is_live: false,
+                    ..Default::default()
                 },
             ))
         })
@@ -880,57 +878,12 @@ pub async fn get_search_suggestions(
 }
 
 #[tauri::command]
-pub async fn search_music(
-    query: String,
-    filter: String,
-    youtube_service: State<'_, YoutubeService>,
-) -> Result<Vec<VideoSummary>, ErrorResponse> {
-    youtube_service
-        .search_music(&query, &filter)
-        .await
-        .map_err(ErrorResponse::from)
-}
-
-#[tauri::command]
 pub async fn parse_subscription_export(
     data: String,
     youtube_service: State<'_, YoutubeService>,
 ) -> Result<Vec<(String, String)>, ErrorResponse> {
     youtube_service
         .parse_subscription_export(&data)
-        .map_err(ErrorResponse::from)
-}
-
-#[tauri::command]
-pub async fn get_music_lyrics(
-    video_id: String,
-    youtube_service: State<'_, YoutubeService>,
-) -> Result<Option<String>, ErrorResponse> {
-    youtube_service
-        .get_music_lyrics(&video_id)
-        .await
-        .map_err(ErrorResponse::from)
-}
-
-#[tauri::command]
-pub async fn get_music_related(
-    video_id: String,
-    youtube_service: State<'_, YoutubeService>,
-) -> Result<Vec<VideoSummary>, ErrorResponse> {
-    youtube_service
-        .get_music_related(&video_id)
-        .await
-        .map_err(ErrorResponse::from)
-}
-
-#[tauri::command]
-pub async fn get_music_album(
-    album_browse_id: String,
-    youtube_service: State<'_, YoutubeService>,
-) -> Result<Vec<VideoSummary>, ErrorResponse> {
-    youtube_service
-        .get_music_album(&album_browse_id)
-        .await
         .map_err(ErrorResponse::from)
 }
 
@@ -1158,40 +1111,6 @@ pub async fn get_return_youtube_dislike(
 }
 
 #[tauri::command]
-pub async fn get_music_home(
-    youtube_service: State<'_, YoutubeService>,
-    recommendation_service: State<'_, RecommendationService>,
-) -> Result<(Vec<MusicHomeSection>, Vec<MusicHomeChip>), ErrorResponse> {
-    if let Ok(Some(cached)) = recommendation_service.get_cached_music_home().await {
-        return Ok(cached);
-    }
-
-    let (sections, chips) = youtube_service
-        .get_music_home()
-        .await
-        .map_err(ErrorResponse::from)?;
-    let _ = recommendation_service
-        .cache_music_home(&sections, &chips)
-        .await;
-    Ok((sections, chips))
-}
-
-#[tauri::command]
-pub async fn refresh_music_home(
-    youtube_service: State<'_, YoutubeService>,
-    recommendation_service: State<'_, RecommendationService>,
-) -> Result<(Vec<MusicHomeSection>, Vec<MusicHomeChip>), ErrorResponse> {
-    let (sections, chips) = youtube_service
-        .get_music_home()
-        .await
-        .map_err(ErrorResponse::from)?;
-    let _ = recommendation_service
-        .cache_music_home(&sections, &chips)
-        .await;
-    Ok((sections, chips))
-}
-
-#[tauri::command]
 pub async fn get_subscription_rotation_feed(
     youtube_service: State<'_, YoutubeService>,
     recommendation_service: State<'_, RecommendationService>,
@@ -1252,6 +1171,7 @@ pub(crate) async fn populate_video_durations(
                         view_count_text: None,
                         channel_avatar_url: None,
                         is_live: false,
+                        ..Default::default()
                     };
                     // Cache it for 7 days
                     let _ = crate::db::cache::cache_video_summary(&pool, &summary, 604800).await;
@@ -1458,44 +1378,6 @@ pub async fn stream_subscription_rss_feed(
     });
 
     Ok(())
-}
-
-#[tauri::command]
-pub async fn get_music_artist(
-    artist_browse_id: String,
-    youtube_service: State<'_, YoutubeService>,
-) -> Result<ArtistPage, ErrorResponse> {
-    validate_browse_id(&artist_browse_id).map_err(ErrorResponse::from)?;
-
-    youtube_service
-        .get_music_artist(&artist_browse_id)
-        .await
-        .map_err(ErrorResponse::from)
-}
-
-#[tauri::command]
-pub async fn get_music_explore(
-    youtube_service: State<'_, YoutubeService>,
-) -> Result<ExplorePage, ErrorResponse> {
-    youtube_service
-        .get_music_explore()
-        .await
-        .map_err(ErrorResponse::from)
-}
-
-#[tauri::command]
-pub async fn get_music_charts(
-    continuation: Option<String>,
-    youtube_service: State<'_, YoutubeService>,
-) -> Result<ChartsPage, ErrorResponse> {
-    if let Some(ref token) = continuation {
-        validate_browse_id(token).map_err(ErrorResponse::from)?;
-    }
-
-    youtube_service
-        .get_music_charts(continuation)
-        .await
-        .map_err(ErrorResponse::from)
 }
 
 #[tauri::command]

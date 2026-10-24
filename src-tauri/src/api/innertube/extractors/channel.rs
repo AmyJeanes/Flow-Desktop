@@ -1,11 +1,13 @@
 use crate::api::innertube::InnertubeClient;
 use crate::api::innertube::core::clients;
-use crate::api::innertube::core::utils::{
-    detect_lockup_is_live, detect_video_is_live, extract_channel_id_from_video_renderer,
-    normalize_youtube_image_url, parse_duration_seconds, parse_mixed_number_word_to_long,
-    short_video_summary_from_item,
-};
+use crate::api::innertube::core::utils::short_video_summary_from_item;
 use crate::api::innertube::json::continuation::{continuation_item_lists, continuation_token};
+use crate::api::innertube::json::count::parse_count;
+use crate::api::innertube::json::duration::parse_duration;
+use crate::api::innertube::json::text::text_of;
+use crate::api::innertube::json::thumbnail::{largest_url, normalize_youtube_image_url};
+use crate::api::innertube::renderers::lockup::is_live as lockup_is_live;
+use crate::api::innertube::renderers::video::video_from_renderer;
 use crate::errors::{AppError, AppResult};
 use crate::models::channel::{
     ChannelDetails, ChannelItem, ChannelTabResponse, PlaylistSummary, PostSummary,
@@ -15,55 +17,12 @@ use crate::models::video::VideoSummary;
 use serde_json::Value;
 use tracing::debug;
 
-fn normalize_large_google_image_url(url: &str) -> String {
-    if url.starts_with("//") {
-        format!("https:{url}")
-    } else {
-        url.to_string()
-    }
-}
-
-fn thumbnail_area(thumbnail: &Value) -> u64 {
-    let width = thumbnail.get("width").and_then(Value::as_u64).unwrap_or(0);
-    let height = thumbnail.get("height").and_then(Value::as_u64).unwrap_or(0);
-    width.saturating_mul(height)
-}
-
-fn best_thumbnail_url(thumbnails: &Value) -> Option<String> {
-    thumbnails.as_array().and_then(|arr| {
-        arr.iter()
-            .max_by_key(|thumb| thumbnail_area(thumb))
-            .and_then(|thumb| thumb.get("url").or_else(|| thumb.get("uri")))
-            .and_then(Value::as_str)
-            .map(normalize_large_google_image_url)
-    })
-}
-
-fn text_from_text_runs(value: &Value) -> Option<String> {
-    value
-        .get("runs")
-        .and_then(Value::as_array)
-        .map(|runs| {
-            runs.iter()
-                .filter_map(|run| run.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .filter(|text| !text.is_empty())
-        .or_else(|| {
-            value
-                .get("simpleText")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-}
-
 fn post_comment_count_text(post: &Value) -> Option<String> {
     let reply_button =
         &post["actionButtons"]["commentActionButtonsRenderer"]["replyButton"]["buttonRenderer"];
     reply_button
         .get("text")
-        .and_then(text_from_text_runs)
+        .and_then(text_of)
         .or_else(|| {
             reply_button
                 .get("accessibility")
@@ -97,7 +56,7 @@ fn post_image_attachment_url(post: &Value) -> Option<String> {
         .get("backstageImageRenderer")
         .and_then(|renderer| renderer.get("image"))
         .and_then(|image| image.get("thumbnails"))
-        .and_then(best_thumbnail_url)
+        .and_then(largest_url)
         .or_else(|| {
             attachment
                 .get("postMultiImageRenderer")
@@ -107,7 +66,7 @@ fn post_image_attachment_url(post: &Value) -> Option<String> {
                 .and_then(|image| image.get("backstageImageRenderer"))
                 .and_then(|renderer| renderer.get("image"))
                 .and_then(|image| image.get("thumbnails"))
-                .and_then(best_thumbnail_url)
+                .and_then(largest_url)
         })
 }
 
@@ -157,133 +116,18 @@ fn extract_videos_from_browse(
                 target = content;
             }
 
-            if let Some(video) = target
+            if let Some(mut video) = target
                 .get("gridVideoRenderer")
                 .or_else(|| target.get("videoRenderer"))
+                .and_then(video_from_renderer)
             {
-                if let Some(video_id) = video.get("videoId").and_then(|v| v.as_str()) {
-                    let title = video
-                        .get("title")
-                        .and_then(|t| {
-                            t.get("runs")
-                                .and_then(|r| r.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|f| f.get("text"))
-                                .and_then(|s| s.as_str())
-                                .or_else(|| t.get("simpleText").and_then(|s| s.as_str()))
-                        })
-                        .unwrap_or_default()
-                        .to_string();
-
-                    let channel_name = video
-                        .get("shortBylineText")
-                        .and_then(|b| {
-                            b.get("runs")
-                                .and_then(|r| r.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|f| f.get("text"))
-                                .and_then(|s| s.as_str())
-                        })
-                        .or_else(|| {
-                            video.get("longBylineText").and_then(|b| {
-                                b.get("runs")
-                                    .and_then(|r| r.as_array())
-                                    .and_then(|arr| arr.first())
-                                    .and_then(|f| f.get("text"))
-                                    .and_then(|s| s.as_str())
-                            })
-                        })
-                        .unwrap_or_default()
-                        .to_string();
-
-                    let thumbnail_url = video
-                        .get("thumbnail")
-                        .and_then(|th| {
-                            th.get("thumbnails")
-                                .and_then(|t| t.as_array())
-                                .and_then(|arr| arr.last())
-                                .and_then(|f| f.get("url"))
-                                .and_then(|s| s.as_str())
-                        })
-                        .map(|s| s.to_string());
-
-                    let duration_text = video
-                        .get("thumbnailOverlays")
-                        .and_then(|o| o.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|first| first.get("thumbnailOverlayTimeStatusRenderer"))
-                        .and_then(|t| t.get("text"))
-                        .and_then(|txt| {
-                            txt.get("runs")
-                                .and_then(|r| r.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|f| f.get("text"))
-                                .and_then(|s| s.as_str())
-                                .or_else(|| txt.get("simpleText").and_then(|s| s.as_str()))
-                        })
-                        .or_else(|| {
-                            video.get("lengthText").and_then(|l| {
-                                l.get("runs")
-                                    .and_then(|r| r.as_array())
-                                    .and_then(|arr| arr.first())
-                                    .and_then(|f| f.get("text"))
-                                    .and_then(|s| s.as_str())
-                                    .or_else(|| l.get("simpleText").and_then(|s| s.as_str()))
-                            })
-                        })
-                        .unwrap_or_default();
-
-                    let duration_seconds = if duration_text.is_empty() {
-                        None
-                    } else {
-                        Some(parse_duration_seconds(duration_text))
-                    };
-
-                    let published_text = video
-                        .get("publishedTimeText")
-                        .and_then(|p| {
-                            p.get("simpleText").and_then(|s| s.as_str()).or_else(|| {
-                                p.get("runs")
-                                    .and_then(|r| r.as_array())
-                                    .and_then(|arr| arr.first())
-                                    .and_then(|f| f.get("text"))
-                                    .and_then(|s| s.as_str())
-                            })
-                        })
-                        .map(|s| s.to_string());
-
-                    let view_count_text = video
-                        .get("viewCountText")
-                        .and_then(|v| {
-                            v.get("simpleText").and_then(|s| s.as_str()).or_else(|| {
-                                v.get("runs")
-                                    .and_then(|r| r.as_array())
-                                    .and_then(|arr| arr.first())
-                                    .and_then(|f| f.get("text"))
-                                    .and_then(|s| s.as_str())
-                            })
-                        })
-                        .map(|s| s.to_string());
-
-                    let channel_id = extract_channel_id_from_video_renderer(video);
-
-                    items.push(ChannelItem::Video(VideoSummary {
-                        id: video_id.to_string(),
-                        title,
-                        channel_name: if channel_name.is_empty() {
-                            top_channel_name.clone()
-                        } else {
-                            channel_name
-                        },
-                        channel_id: channel_id.or_else(|| top_channel_id.clone()),
-                        thumbnail_url,
-                        duration_seconds,
-                        published_text,
-                        view_count_text,
-                        channel_avatar_url: None,
-                        is_live: detect_video_is_live(video),
-                    }));
+                if video.channel_name.is_empty() {
+                    video.channel_name.clone_from(&top_channel_name);
                 }
+                if video.channel_id.is_none() {
+                    video.channel_id.clone_from(&top_channel_id);
+                }
+                items.push(ChannelItem::Video(video));
             } else if let Some(short) = short_video_summary_from_item(target) {
                 items.push(ChannelItem::Short(short));
             } else if let Some(playlist) = target
@@ -476,7 +320,7 @@ fn extract_videos_from_browse(
                         }
 
                         if !duration_text.is_empty() {
-                            duration_seconds = Some(parse_duration_seconds(duration_text));
+                            duration_seconds = parse_duration(duration_text);
                         }
 
                         let mut view_count_text = None;
@@ -535,7 +379,8 @@ fn extract_videos_from_browse(
                             published_text,
                             view_count_text,
                             channel_avatar_url: None,
-                            is_live: detect_lockup_is_live(lockup),
+                            is_live: lockup_is_live(lockup),
+                            ..Default::default()
                         }));
                     }
                 }
@@ -572,7 +417,7 @@ fn extract_videos_from_browse(
                     })
                     .map(normalize_youtube_image_url)
                     .map(|s| s.to_string());
-                let text_content = post.get("contentText").and_then(text_from_text_runs);
+                let text_content = post.get("contentText").and_then(text_of);
                 let published_time_text = post
                     .get("publishedTimeText")
                     .and_then(|p| {
@@ -1070,7 +915,7 @@ impl InnertubeClient {
             .get("c4TabbedHeaderRenderer")
             .and_then(|c4| c4.get("banner"))
             .and_then(|b| b.get("thumbnails"))
-            .and_then(best_thumbnail_url)
+            .and_then(largest_url)
             .or_else(|| {
                 header
                     .get("pageHeaderRenderer")
@@ -1080,9 +925,8 @@ impl InnertubeClient {
                     .and_then(|b| b.get("imageBannerViewModel"))
                     .and_then(|ib| ib.get("image"))
                     .and_then(|img| img.get("sources"))
-                    .and_then(best_thumbnail_url)
-            })
-            .map(|s| normalize_large_google_image_url(&s));
+                    .and_then(largest_url)
+            });
 
         let mut subscriber_count = None;
         let mut subscriber_count_text = None;
@@ -1094,7 +938,7 @@ impl InnertubeClient {
             .and_then(|v| v.as_str())
         {
             subscriber_count_text = Some(text.to_string());
-            subscriber_count = Some(parse_mixed_number_word_to_long(text));
+            subscriber_count = parse_count(text);
         } else if let Some(runs) = header
             .get("c4TabbedHeaderRenderer")
             .and_then(|c4| c4.get("subscriberCountText"))
@@ -1107,7 +951,7 @@ impl InnertubeClient {
                 .and_then(|v| v.as_str())
             {
                 subscriber_count_text = Some(text.to_string());
-                subscriber_count = Some(parse_mixed_number_word_to_long(text));
+                subscriber_count = parse_count(text);
             }
         } else if let Some(rows) = header
             .get("pageHeaderRenderer")
@@ -1128,7 +972,7 @@ impl InnertubeClient {
                         {
                             if text.contains("subscriber") {
                                 subscriber_count_text = Some(text.to_string());
-                                subscriber_count = Some(parse_mixed_number_word_to_long(text));
+                                subscriber_count = parse_count(text);
                                 break;
                             }
                         }
