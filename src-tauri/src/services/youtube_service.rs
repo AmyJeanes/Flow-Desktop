@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::api::innertube::InnertubeClient;
+use crate::api::innertube::extractors::resolve::ResolvedEndpoint;
 use crate::errors::AppResult;
-use crate::models::channel::{ChannelDetails, ChannelTabResponse};
+use crate::models::channel::{ChannelAbout, ChannelDetails, ChannelPage, ChannelTabResponse};
 use crate::models::comment::CommentsResponse;
 use crate::models::explore::{ExploreGrid, ExplorePage, ExploreTarget};
 use crate::models::live_chat::LiveChatResponse;
@@ -55,6 +56,14 @@ impl YoutubeService {
 
     pub async fn get_stream_info(&self, video_id: &str, refresh: bool) -> AppResult<StreamInfo> {
         self.extractor.get_stream_info(video_id, refresh).await
+    }
+
+    pub async fn get_channel_page(&self, channel_id: &str) -> AppResult<ChannelPage> {
+        self.extractor.get_channel_page(channel_id).await
+    }
+
+    pub async fn get_channel_about(&self, token: &str) -> AppResult<ChannelAbout> {
+        self.extractor.get_channel_about(token).await
     }
 
     pub async fn get_channel_details(&self, channel_id: &str) -> AppResult<ChannelDetails> {
@@ -148,6 +157,10 @@ impl YoutubeService {
     /// Title, channel and counts for the first reels in `items` that came without them.
     pub async fn fill_short_details(&self, items: &mut [ShortItem]) {
         self.extractor.fill_reel_overlays(items).await;
+    }
+
+    pub async fn resolve_url(&self, url: &str) -> AppResult<ResolvedEndpoint> {
+        self.extractor.resolve_url(url).await
     }
 
     pub async fn get_search_suggestions(
