@@ -6,6 +6,7 @@ use crate::api::innertube::core::player_requests::{PlaybackPriority, PlayerFligh
 use crate::api::innertube::core::utils::{
     collect_related_content_items, dedupe_related_content_items,
     extract_channel_id_from_video_renderer, extract_text_from_value, thumbnail_url_from_array,
+    watch_next_body,
 };
 use crate::errors::{AppError, AppResult};
 use crate::models::video::{
@@ -1124,15 +1125,35 @@ fn extract_duration_seconds_from_player_response(response: &Value) -> Option<u64
         })
 }
 
-fn clean_like_count_from_accessibility(text: &str) -> String {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for w in words {
-        let cleaned_word = w.trim_matches(|c: char| !c.is_alphanumeric() && c != ',' && c != '.');
-        if cleaned_word.chars().any(|c| c.is_ascii_digit()) {
-            return cleaned_word.to_string();
-        }
-    }
-    text.to_string()
+/// The first word of `text` holding a digit ("26K" from "like this video along with 26K
+/// other people"), or none when likes are hidden and the label is just "I like this".
+fn clean_like_count_from_accessibility(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != ',' && c != '.'))
+        .find(|w| w.chars().any(|c| c.is_ascii_digit()))
+        .map(ToOwned::to_owned)
+}
+
+/// The like count on the watch page's like button: its `title` ("26K"), else the number in its
+/// accessibility label. A title without a digit is the hidden-likes "Like".
+fn like_count_from_button(button_vm: &Value) -> Option<String> {
+    extract_text_from_value(&button_vm["title"])
+        .filter(|title| title.chars().any(|c| c.is_ascii_digit()))
+        .or_else(|| {
+            button_vm["accessibilityText"]
+                .as_str()
+                .and_then(clean_like_count_from_accessibility)
+        })
+}
+
+/// The watch page's view count with every run kept, so a live stream reads "197 watching now"
+/// instead of "197".
+fn watch_view_count_text(primary_info: &Value) -> Option<String> {
+    let renderer = &primary_info["viewCount"]["videoViewCountRenderer"];
+    extract_text_from_value(&renderer["viewCount"])
+        .or_else(|| extract_text_from_value(&renderer["shortViewCount"]))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -1625,19 +1646,7 @@ impl InnertubeClient {
         po_token: Option<&str>,
         referer: Option<&str>,
     ) -> Option<Value> {
-        let mut context = client.player_context(visitor_data, po_token, None);
-        if client.is_embedded {
-            context["thirdParty"] = serde_json::json!({
-                "embedUrl": format!("https://www.youtube.com/watch?v={video_id}")
-            });
-        }
-
-        let mut payload = serde_json::json!({
-            "context": context,
-            "videoId": video_id,
-            "contentCheckOk": true,
-            "racyCheckOk": true,
-        });
+        let mut payload = client.player_body(video_id, visitor_data, po_token);
         if client.use_signature_timestamp {
             let timestamp = player_js::signature_timestamp()
                 .await
@@ -1768,9 +1777,7 @@ impl InnertubeClient {
         let mut view_count_text = None;
         let mut published_text = None;
 
-        let mut next_payload = serde_json::json!({
-            "videoId": &id
-        });
+        let mut next_payload = watch_next_body(&id);
         // Likes, views and the publish date are optional; a deep link waits on
         // this whole call before it can start playback, so it is bounded and
         // kept off the connection the feed fan-out saturates.
@@ -1813,27 +1820,8 @@ impl InnertubeClient {
             }
 
             if !primary_info.is_null() {
-                // Extract views
-                if let Some(views) =
-                    primary_info["viewCount"]["videoViewCountRenderer"]["viewCount"]["simpleText"]
-                        .as_str()
-                        .or_else(|| {
-                            primary_info["viewCount"]["videoViewCountRenderer"]["viewCount"]["runs"]
-                                [0]["text"]
-                                .as_str()
-                        })
-                        .or_else(|| {
-                            primary_info["viewCount"]["videoViewCountRenderer"]["shortViewCount"]
-                            ["simpleText"]
-                            .as_str()
-                        })
-                        .or_else(|| {
-                            primary_info["viewCount"]["videoViewCountRenderer"]["shortViewCount"]
-                            ["runs"][0]["text"]
-                            .as_str()
-                        })
-                {
-                    view_count_text = Some(views.to_string());
+                if let Some(views) = watch_view_count_text(primary_info) {
+                    view_count_text = Some(views);
                 }
 
                 // Extract published text
@@ -1855,15 +1843,7 @@ impl InnertubeClient {
                             let button_vm = &view_model["likeButtonViewModel"]["likeButtonViewModel"]
                                 ["toggleButtonViewModel"]["toggleButtonViewModel"]["defaultButtonViewModel"]
                                 ["buttonViewModel"];
-                            if let Some(title) = button_vm["title"]["runs"][0]["text"]
-                                .as_str()
-                                .or_else(|| button_vm["title"]["simpleText"].as_str())
-                            {
-                                like_count_text = Some(title.to_string());
-                            } else if let Some(acc_text) = button_vm["accessibilityText"].as_str() {
-                                like_count_text =
-                                    Some(clean_like_count_from_accessibility(acc_text));
-                            }
+                            like_count_text = like_count_from_button(button_vm);
                         }
                         if like_count_text.is_none() {
                             if let Some(renderer) = btn.get("segmentedLikeDislikeButtonRenderer") {
@@ -1880,7 +1860,7 @@ impl InnertubeClient {
                                         })
                                     {
                                         like_count_text =
-                                            Some(clean_like_count_from_accessibility(label));
+                                            clean_like_count_from_accessibility(label);
                                     } else if let Some(text) = toggle_btn["defaultText"]["runs"][0]
                                         ["text"]
                                         .as_str()
@@ -1932,9 +1912,7 @@ impl InnertubeClient {
             return Err(AppError::Validation("Video ID cannot be empty".into()));
         }
 
-        let mut payload = serde_json::json!({
-            "videoId": video_id_trimmed
-        });
+        let mut payload = watch_next_body(video_id_trimmed);
 
         let next_res = self
             .post_innertube("next", &clients::WEB, &mut payload)
@@ -2217,17 +2195,10 @@ mod sabr_live_smoke {
             po_token.is_some()
         );
 
-        let mut payload = serde_json::json!({
-            "context": clients::IPADOS.player_context(
-                visitor_data.as_deref(),
-                po_token.as_deref(),
-                None,
-            ),
-            "videoId": video_id,
-            "contentCheckOk": true,
-            "racyCheckOk": true,
-            "playbackContext": { "contentPlaybackContext": { "signatureTimestamp": 19550 } }
-        });
+        let mut payload =
+            clients::IPADOS.player_body(&video_id, visitor_data.as_deref(), po_token.as_deref());
+        payload["playbackContext"] =
+            serde_json::json!({ "contentPlaybackContext": { "signatureTimestamp": 19550 } });
         let res = client
             .post_innertube("player", &clients::IPADOS, &mut payload)
             .await
@@ -2385,31 +2356,29 @@ mod sabr_client_probe {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// Builds the context straight from the registry, so the probe measures the
+    /// Builds the body straight from the registry, so the probe measures the
     /// same identity the app actually sends rather than a copy of it.
     ///
-    /// `pot` is passed through `player_context`, which drops it for any client
-    /// whose attestation platform a BotGuard token is not valid for — so a run
+    /// `pot` is passed through `player_body`, which drops it for any client
+    /// whose attestation platform a web PO token is not valid for, so a run
     /// with `send_pot = true` on an iOS/Android client is the control case
     /// showing that omitting the token changes nothing for them.
-    fn context_for(
+    fn body_for(
+        video_id: &str,
         client: &clients::YouTubeClient,
         visitor: Option<String>,
         pot: Option<String>,
     ) -> Value {
-        let mut ctx = client.player_context(visitor.as_deref(), pot.as_deref(), None);
+        let mut body = client.player_body(video_id, visitor.as_deref(), pot.as_deref());
         if let Some(timestamp) = client.signature_timestamp() {
-            ctx["playbackContext"] = serde_json::json!({
+            body["playbackContext"] = serde_json::json!({
                 "contentPlaybackContext": { "signatureTimestamp": timestamp }
             });
         }
-        ctx
+        body
     }
 
-    async fn raw_player(video_id: &str, c: &clients::YouTubeClient, ctx: Value) -> Option<Value> {
-        let payload = serde_json::json!({
-            "context": ctx, "videoId": video_id, "contentCheckOk": true, "racyCheckOk": true,
-        });
+    async fn raw_player(c: &clients::YouTubeClient, payload: Value) -> Option<Value> {
         let r = reqwest::Client::new()
             .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
             .header(reqwest::header::USER_AGENT, c.user_agent)
@@ -2487,13 +2456,10 @@ mod sabr_client_probe {
                 send_pot,
                 send_pot && c.accepts_web_po_token()
             );
-            let ctx = context_for(c, visitor_data.clone(), use_pot.clone());
-            let res = match raw_player(&video_id, c, ctx).await {
-                Some(v) => v,
-                None => {
-                    println!("  player request FAILED\n");
-                    continue;
-                }
+            let body = body_for(&video_id, c, visitor_data.clone(), use_pot.clone());
+            let Some(res) = raw_player(c, body).await else {
+                println!("  player request FAILED\n");
+                continue;
             };
             let status = res["playabilityStatus"]["status"].as_str().unwrap_or("?");
             if !status.eq_ignore_ascii_case("OK") {
@@ -2937,5 +2903,51 @@ mod ladder_live {
             engine.cancel();
             assert!(first.is_ok(), "{} SABR must deliver media", candidate.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod watch_metadata {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn live_view_count_keeps_every_run() {
+        let primary = json!({ "viewCount": { "videoViewCountRenderer": {
+            "viewCount": { "runs": [{ "text": "197" }, { "text": " watching now" }] },
+            "isLive": true
+        } } });
+        assert_eq!(
+            watch_view_count_text(&primary).as_deref(),
+            Some("197 watching now")
+        );
+
+        let vod = json!({ "viewCount": { "videoViewCountRenderer": {
+            "viewCount": { "simpleText": "1,234,567 views" }
+        } } });
+        assert_eq!(
+            watch_view_count_text(&vod).as_deref(),
+            Some("1,234,567 views")
+        );
+    }
+
+    #[test]
+    fn like_count_reads_the_title_string_and_needs_a_digit() {
+        assert_eq!(
+            like_count_from_button(&json!({ "title": "26K" })).as_deref(),
+            Some("26K")
+        );
+        assert_eq!(
+            like_count_from_button(&json!({
+                "title": "Like",
+                "accessibilityText": "like this video along with 26,104 other people"
+            }))
+            .as_deref(),
+            Some("26,104")
+        );
+        assert_eq!(
+            like_count_from_button(&json!({ "title": "Like", "accessibilityText": "I like this" })),
+            None
+        );
     }
 }
