@@ -7,7 +7,7 @@ use crate::models::channel::{ChannelDetails, ChannelTabResponse};
 use crate::models::comment::CommentsResponse;
 use crate::models::playlist::PlaylistDetailsResponse;
 use crate::models::search::{SearchVideosRequest, SearchVideosResponse};
-use crate::models::video::{RelatedContentItem, StreamInfo, VideoDetails, VideoSummary};
+use crate::models::video::{RelatedPage, StreamInfo, VideoDetails, VideoSummary};
 use crate::security::validation::{
     validate_browse_id, validate_channel_id, validate_page_token, validate_search_query,
     validate_video_id,
@@ -532,15 +532,40 @@ pub async fn get_related_videos(
     video_id: String,
     youtube_service: State<'_, YoutubeService>,
     recommendation_service: State<'_, RecommendationService>,
-) -> Result<Vec<RelatedContentItem>, ErrorResponse> {
+) -> Result<RelatedPage, ErrorResponse> {
     validate_video_id(&video_id).map_err(ErrorResponse::from)?;
 
     let related = youtube_service
         .get_related_videos(&video_id)
         .await
         .map_err(ErrorResponse::from)?;
-    recommendation_service.note_related(&video_id, &related);
+    recommendation_service.note_related(&video_id, &related.items);
     Ok(related)
+}
+
+/// The video's category, for the recommendation engine. A small request of
+/// its own, so the watch page asks only once playback has settled.
+#[tauri::command]
+pub async fn get_video_category(
+    video_id: String,
+    youtube_service: State<'_, YoutubeService>,
+) -> Result<Option<String>, ErrorResponse> {
+    validate_video_id(&video_id).map_err(ErrorResponse::from)?;
+    youtube_service
+        .get_video_category(&video_id)
+        .await
+        .map_err(ErrorResponse::from)
+}
+
+#[tauri::command]
+pub async fn get_more_related_videos(
+    continuation: String,
+    youtube_service: State<'_, YoutubeService>,
+) -> Result<RelatedPage, ErrorResponse> {
+    youtube_service
+        .get_more_related_videos(&continuation)
+        .await
+        .map_err(ErrorResponse::from)
 }
 
 #[tauri::command]
@@ -844,12 +869,13 @@ pub async fn get_post_comments(
 pub async fn get_live_chat(
     video_id: String,
     continuation: Option<String>,
+    replay_offset_ms: Option<u64>,
     youtube_service: State<'_, YoutubeService>,
 ) -> Result<crate::models::live_chat::LiveChatResponse, ErrorResponse> {
     validate_video_id(&video_id).map_err(ErrorResponse::from)?;
 
     youtube_service
-        .get_live_chat(&video_id, continuation)
+        .get_live_chat(&video_id, continuation, replay_offset_ms)
         .await
         .map_err(ErrorResponse::from)
 }

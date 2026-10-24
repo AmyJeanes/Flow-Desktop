@@ -1,3 +1,4 @@
+pub mod category;
 pub mod channel;
 pub mod comments;
 pub mod live_chat;
@@ -8,3 +9,4 @@ pub mod search;
 pub mod shorts;
 pub mod subscription;
 pub mod trending;
+pub mod watch_next;
