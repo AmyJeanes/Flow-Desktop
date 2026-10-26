@@ -86,6 +86,37 @@ pub async fn get_download_formats(
     })
 }
 
+/// Shows a saved download in Finder or Explorer. The path comes from the library,
+/// never from the caller.
+#[tauri::command]
+pub async fn reveal_download(
+    video_id: String,
+    media_kind: DownloadMediaKind,
+    pool: State<'_, SqlitePool>,
+) -> Result<(), ErrorResponse> {
+    validate_video_id(&video_id).map_err(ErrorResponse::from)?;
+    let record =
+        crate::db::downloads::download_by_video_id(&pool, &video_id, media_kind_names(media_kind))
+            .await
+            .map_err(ErrorResponse::from)?
+            .ok_or_else(|| download_error("No saved download for this item"))?;
+    tauri_plugin_opener::reveal_item_in_dir(&record.file_path)
+        .map_err(|error| download_error(format!("Could not show the file: {error}")))
+}
+
+/// A system notification for a download that ended while Flow was in the
+/// background. The window decides when, and sends the text in the user's language.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri commands deserialize owned arguments.
+pub fn show_download_notification(title: String, body: String, app: AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    let title: String = title.chars().take(120).collect();
+    let body: String = body.chars().take(240).collect();
+    if let Err(error) = app.notification().builder().title(title).body(body).show() {
+        tracing::warn!(%error, "Failed to post a download notification");
+    }
+}
+
 /// How many downloads run at once, from the Downloads settings.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri commands deserialize owned State.
@@ -793,11 +824,32 @@ async fn find_artwork_sidecar(media_path: &str) -> Option<(String, String)> {
     None
 }
 
-async fn read_lyrics_sidecar(media_path: &str) -> Option<String> {
+/// The lyrics saved with a song: the `.lrc` beside it (synced, and user-editable),
+/// else the lyrics tag inside the file, which every download since M4A songs carries.
+async fn read_saved_lyrics(media_path: &str) -> Option<String> {
     let path = Path::new(media_path).with_extension("lrc");
-    tokio::fs::read_to_string(path)
+    if let Some(text) = tokio::fs::read_to_string(path)
         .await
         .ok()
+        .filter(|text| !text.trim().is_empty())
+    {
+        return Some(text);
+    }
+    let media_path = PathBuf::from(media_path);
+    tokio::task::spawn_blocking(move || read_embedded_lyrics(&media_path))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn read_embedded_lyrics(path: &Path) -> Option<String> {
+    use lofty::file::TaggedFileExt;
+    use lofty::prelude::ItemKey;
+
+    let tagged = lofty::probe::Probe::open(path).ok()?.read().ok()?;
+    let tag = tagged.primary_tag()?;
+    tag.get_string(ItemKey::Lyrics)
+        .map(str::to_owned)
         .filter(|text| !text.trim().is_empty())
 }
 
@@ -859,7 +911,7 @@ pub async fn get_offline_stream(
         url: format!("http://127.0.0.1:{port}/stream/{token}"),
         content_type,
         artwork_url,
-        lyrics: read_lyrics_sidecar(&record.file_path).await,
+        lyrics: read_saved_lyrics(&record.file_path).await,
         loudness_db: record.loudness_db,
         captions: offline_captions(&streaming_manager, &record),
     })
@@ -884,14 +936,6 @@ fn offline_content_type(path: &str, media_kind: DownloadMediaKind) -> String {
         .to_ascii_lowercase();
     let is_video = matches!(media_kind, DownloadMediaKind::Video);
     match extension.as_str() {
-        "mp4" | "m4v" => {
-            if is_video {
-                "video/mp4"
-            } else {
-                "audio/mp4"
-            }
-        }
-        "m4a" => "audio/mp4",
         "webm" | "mkv" => {
             if is_video {
                 "video/webm"
@@ -901,6 +945,7 @@ fn offline_content_type(path: &str, media_kind: DownloadMediaKind) -> String {
         }
         "opus" | "ogg" => "audio/ogg",
         "mp3" => "audio/mpeg",
+        // MP4 and M4A, and anything unknown.
         _ => {
             if is_video {
                 "video/mp4"
