@@ -40,7 +40,6 @@ export interface RouteChangePlayerInput {
   nextWatchId: string | null;
   currentVideoId: string | null;
   videoPlayerMode: VideoPlayerMode;
-  isPlaying: boolean;
   autoPipEnabled: boolean;
 }
 
@@ -52,5 +51,5 @@ export function decideRouteChangePlayerAction(input: RouteChangePlayerInput): Ro
   if (nextWatchId !== null || input.previousWatchId !== currentVideoId || input.videoPlayerMode !== "watch") {
     return "none";
   }
-  return input.isPlaying && input.autoPipEnabled ? "enter-pip" : "dismiss";
+  return input.autoPipEnabled ? "enter-pip" : "dismiss";
 }

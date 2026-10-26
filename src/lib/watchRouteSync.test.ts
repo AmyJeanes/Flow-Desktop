@@ -52,13 +52,11 @@ describe("decideRouteChangePlayerAction", () => {
     nextWatchId: null,
     currentVideoId: "a",
     videoPlayerMode: "watch" as const,
-    isPlaying: true,
     autoPipEnabled: true,
   };
 
-  it("shrinks a playing video into the mini player when leaving its page", () => {
+  it("shrinks the video into the mini player when leaving its page, paused or playing", () => {
     expect(decideRouteChangePlayerAction(base)).toBe("enter-pip");
-    expect(decideRouteChangePlayerAction({ ...base, isPlaying: false })).toBe("dismiss");
     expect(decideRouteChangePlayerAction({ ...base, autoPipEnabled: false })).toBe("dismiss");
   });
 

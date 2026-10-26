@@ -175,7 +175,6 @@ export function GlobalVideoPlayer() {
       nextWatchId: watchVideoIdFromPath(location.pathname),
       currentVideoId: player.currentVideo?.id ?? null,
       videoPlayerMode: player.videoPlayerMode,
-      isPlaying: player.isPlaying,
       autoPipEnabled,
     });
     if (action === "expand") expandVideoPlayer();
