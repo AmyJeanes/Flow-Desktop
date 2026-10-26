@@ -1873,5 +1873,21 @@
   "menu_dont_show_channel": "Don't show this channel",
   "menu_save_to_library": "Save to library",
   "menu_remove_from_library": "Remove from library",
-  "playlist_card_view_full": "View full playlist"
+  "playlist_card_view_full": "View full playlist",
+  "search_placeholder": "Search",
+  "search_submit": "Search",
+  "search_clear": "Clear search",
+  "search_recent": "Recent searches",
+  "search_clear_history": "Clear all",
+  "search_remove_history": "Remove from history",
+  "search_fill": "Edit this search",
+  "search_music_section": "On YouTube Music",
+  "search_kind_song": "Song",
+  "search_kind_video": "Video",
+  "search_kind_album": "Album",
+  "search_kind_artist": "Artist",
+  "search_kind_profile": "Profile",
+  "search_kind_playlist": "Playlist",
+  "topbar_back": "Back",
+  "topbar_forward": "Forward"
 }
