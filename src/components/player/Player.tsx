@@ -21,6 +21,8 @@ import { sponsorBlockCategoryLabel } from "../../lib/sponsorBlockCategories";
 import { usePersistedPlayerVolume } from "../../lib/usePersistedPlayerVolume";
 import { recordPlayerEvent } from "../../lib/playerDiagnostics";
 import { shouldPublishPlaybackTime } from "../../lib/playerProgress";
+import { longPressRate } from "../../lib/pointerGesture";
+import { isPopOutWindow } from "../../lib/api/pip";
 import {
   PlayerGestureOverlay,
   type PlayerSeekFeedback,
@@ -465,10 +467,8 @@ export const Player: React.FC<PlayerProps> = ({
     () => normalizePlaybackRate(playbackSpeedSetting),
     [playbackSpeedSetting],
   );
-  const longPressPlaybackRate = useMemo(
-    () => normalizePlaybackRate(longPressSpeedSetting, 2),
-    [longPressSpeedSetting],
-  );
+  const longPressPlaybackRate = useMemo(() => longPressRate(longPressSpeedSetting), [longPressSpeedSetting]);
+  const [isPopOut] = useState(isPopOutWindow);
   const configuredSpeedOptions = useMemo(
     () => parseCustomSpeedPresets(customSpeedPresets, customSpeedsEnabled),
     [customSpeedPresets, customSpeedsEnabled],
@@ -2656,6 +2656,7 @@ export const Player: React.FC<PlayerProps> = ({
         onSeekFeedback={showSeekFeedback}
         onRevealControls={revealControls}
         isCompact={isPipMode}
+        canDragWindow={isPopOut}
       />
 
       {pendingQualitySwitch && (
