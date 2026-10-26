@@ -20,7 +20,7 @@ import { seekToTime } from "../../lib/playerSeek";
 import { progressTickBelongsTo } from "../../lib/playerProgress";
 import { classifyPlayerError } from "../../lib/playerError";
 import { copyPlayerReport } from "../../lib/playerDiagnostics";
-import { openExternal } from "../../lib/openExternal";
+import { openExternalOrOfferCopy } from "../../lib/openExternal";
 import { youtubeWatchUrl } from "../../lib/youtubeUrl";
 import { getString } from "../../lib/i18n/index";
 import type { FlowPlayerCoreProps } from "./types";
@@ -243,7 +243,7 @@ export function FlowPlayerCore({ videoId, videoDetails, onEnded }: FlowPlayerCor
   }, [errorInfo, videoId, title, watchUrl, stream.sourceMode, stream.selectedQualityId, stream.isLive, showToast]);
 
   const handleOpenInBrowser = useCallback(() => {
-    if (watchUrl) void openExternal(watchUrl);
+    if (watchUrl) void openExternalOrOfferCopy(watchUrl);
   }, [watchUrl]);
 
   return (
