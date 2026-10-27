@@ -21,6 +21,9 @@ import {
   addVideoToStoredPlaylist,
   addVideoToWatchLater,
   getStoredPlaylistById,
+  moveStoredPlaylistTrack,
+  removeVideoFromStoredPlaylist,
+  restoreStoredPlaylistTrack,
   savePlaylistToLibrary,
   updateStoredPlaylistTracks,
 } from "./playlistLibrary";
@@ -44,27 +47,31 @@ const seed = (playlists: unknown[]) => {
   settings.set("user_playlists", JSON.stringify(playlists));
 };
 
+const seedLibrary = () =>
+  seed([
+    {
+      id: WATCH_LATER_PLAYLIST_ID,
+      name: "Watch Later",
+      tracks: [video("a"), video("b"), video("c")],
+      createdAt: "2024-01-01T00:00:00.000Z",
+      source: "Owned",
+    },
+    {
+      id: SAVED_ID,
+      name: "Saved",
+      tracks: [video("a")],
+      createdAt: "2024-01-01T00:00:00.000Z",
+      source: "Saved",
+      thumbnailUrl: "card-thumb",
+      videoCountText: "500 videos",
+    },
+  ]);
+
+const storedIds = async () =>
+  (await getStoredPlaylistById(WATCH_LATER_PLAYLIST_ID))?.tracks.map((track) => track.id);
+
 describe("updateStoredPlaylistTracks", () => {
-  beforeEach(() => {
-    seed([
-      {
-        id: WATCH_LATER_PLAYLIST_ID,
-        name: "Watch Later",
-        tracks: [video("a"), video("b"), video("c")],
-        createdAt: "2024-01-01T00:00:00.000Z",
-        source: "Owned",
-      },
-      {
-        id: SAVED_ID,
-        name: "Saved",
-        tracks: [video("a")],
-        createdAt: "2024-01-01T00:00:00.000Z",
-        source: "Saved",
-        thumbnailUrl: "card-thumb",
-        videoCountText: "500 videos",
-      },
-    ]);
-  });
+  beforeEach(seedLibrary);
 
   it("skips the write when an updater returns the stored tracks unchanged", async () => {
     await updateStoredPlaylistTracks(WATCH_LATER_PLAYLIST_ID, (tracks) => tracks);
@@ -93,6 +100,62 @@ describe("updateStoredPlaylistTracks", () => {
     const stored = await getStoredPlaylistById(WATCH_LATER_PLAYLIST_ID);
     expect(stored?.tracks.map((track) => track.id)).toEqual(["new", "a", "b", "c"]);
     expect(stored?.tracks.find((track) => track.id === "a")?.durationSeconds).toBe(99);
+  });
+});
+
+describe("moveStoredPlaylistTrack", () => {
+  beforeEach(seedLibrary);
+
+  it("moves a track after another, or to the front", async () => {
+    await moveStoredPlaylistTrack(WATCH_LATER_PLAYLIST_ID, "a", "c");
+    expect(await storedIds()).toEqual(["b", "c", "a"]);
+
+    await moveStoredPlaylistTrack(WATCH_LATER_PLAYLIST_ID, "c", null);
+    expect(await storedIds()).toEqual(["c", "b", "a"]);
+  });
+
+  it("is a no-op when the anchor is no longer in the playlist", async () => {
+    await moveStoredPlaylistTrack(WATCH_LATER_PLAYLIST_ID, "a", "gone");
+    expect(await storedIds()).toEqual(["a", "b", "c"]);
+    expect(setSetting).not.toHaveBeenCalled();
+  });
+});
+
+describe("removeVideoFromStoredPlaylist", () => {
+  beforeEach(seedLibrary);
+
+  it("removes by id and refreshes the thumbnail", async () => {
+    const updated = await removeVideoFromStoredPlaylist(WATCH_LATER_PLAYLIST_ID, "a");
+    expect(updated?.tracks.map((track) => track.id)).toEqual(["b", "c"]);
+    expect(updated?.thumbnailUrl).toBe("thumb-b");
+  });
+
+  it("does not write when the video is not in the playlist", async () => {
+    await removeVideoFromStoredPlaylist(WATCH_LATER_PLAYLIST_ID, "gone");
+    expect(setSetting).not.toHaveBeenCalled();
+  });
+});
+
+describe("restoreStoredPlaylistTrack", () => {
+  beforeEach(seedLibrary);
+
+  it("puts a track back after the one it followed, or first", async () => {
+    await removeVideoFromStoredPlaylist(WATCH_LATER_PLAYLIST_ID, "b");
+    await restoreStoredPlaylistTrack(WATCH_LATER_PLAYLIST_ID, video("b"), "a");
+    expect(await storedIds()).toEqual(["a", "b", "c"]);
+
+    await removeVideoFromStoredPlaylist(WATCH_LATER_PLAYLIST_ID, "a");
+    await restoreStoredPlaylistTrack(WATCH_LATER_PLAYLIST_ID, video("a"), null);
+    expect(await storedIds()).toEqual(["a", "b", "c"]);
+  });
+
+  it("puts it last when the track it followed is gone, and never twice", async () => {
+    await removeVideoFromStoredPlaylist(WATCH_LATER_PLAYLIST_ID, "b");
+    await restoreStoredPlaylistTrack(WATCH_LATER_PLAYLIST_ID, video("b"), "gone");
+    expect(await storedIds()).toEqual(["a", "c", "b"]);
+
+    await restoreStoredPlaylistTrack(WATCH_LATER_PLAYLIST_ID, video("b"), "a");
+    expect(await storedIds()).toEqual(["a", "c", "b"]);
   });
 });
 
