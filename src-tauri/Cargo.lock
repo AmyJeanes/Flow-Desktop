@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "flow"
-version = "0.1.0-beta2"
+version = "0.1.0-beta3"
 dependencies = [
  "aes-gcm",
  "async-trait",
