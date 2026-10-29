@@ -13,6 +13,7 @@ use super::envelope::{
     seal_object, verify_object,
 };
 use super::epoch::{check_epoch_key, open_chain, purpose_key};
+use super::gc::{Ack, Logged, VersionVector, record_ack, record_links, record_manifest};
 use super::keys::MemberSecrets;
 use super::paths::{log_path, parse_log_path};
 use super::payload::{decode_payload, encode_payload};
@@ -97,15 +98,18 @@ pub struct Pulled {
     /// answer each other's acks forever.
     consumed: usize,
     stalled: bool,
-    /// The profile links named by the batches and snapshot manifests read, in reading order.
-    links: Vec<String>,
+    /// The links named by the batches and snapshot manifests read, in reading order; `None` is
+    /// the `profiles` collection.
+    links: Vec<Option<String>>,
+    acks: BTreeMap<String, VersionVector>,
+    manifests: Vec<Logged>,
 }
 
 /// What a log object carries, once checked and opened.
 pub(super) enum Content {
     Batch(IncomingBatch),
     Snapshot(Manifest),
-    Ack,
+    Ack(Ack),
 }
 
 pub struct Session<'a, S> {
@@ -320,6 +324,7 @@ impl<'a, S: Store> Session<'a, S> {
         self.record.link = read
             .links
             .into_iter()
+            .flatten()
             .next()
             .unwrap_or_else(|| own.to_owned());
         save_group(pool, &self.record).await?;
@@ -338,7 +343,7 @@ impl<'a, S: Store> Session<'a, S> {
             && pulled.cursor == 0
             && let Some(start) = self.bootstrap().await?
         {
-            pulled.links.extend(start.manifest.link.clone());
+            pulled.links.push(start.manifest.link.clone());
             if link.is_none_or(|l| start.manifest.link.as_deref() == Some(l)) {
                 pulled.batches.insert(start.writer, start.batches);
             }
@@ -369,19 +374,25 @@ impl<'a, S: Store> Session<'a, S> {
                         .await?
                     {
                         Some((position, content)) => {
+                            let seq = position.seq;
                             pulled.positions.insert(did.clone(), position);
-                            if !matches!(content, Content::Ack) {
+                            if !matches!(content, Content::Ack(_)) {
                                 pulled.consumed += 1;
                             }
                             match content {
                                 Content::Batch(batch) => {
-                                    pulled.links.extend(batch.link.clone());
+                                    pulled.links.push(batch.link.clone());
                                     if link.is_none_or(|l| batch.link.as_deref() == Some(l)) {
                                         pulled.batches.entry(did).or_default().push(batch);
                                     }
                                 }
-                                Content::Snapshot(manifest) => pulled.links.extend(manifest.link),
-                                Content::Ack => {}
+                                Content::Snapshot(manifest) => {
+                                    pulled.links.push(manifest.link.clone());
+                                    pulled.manifests.push(Logged { did, seq, manifest });
+                                }
+                                Content::Ack(ack) => {
+                                    pulled.acks.insert(did, ack.vv);
+                                }
                             }
                         }
                         None => still.push((did, seq, path)),
@@ -452,7 +463,9 @@ impl<'a, S: Store> Session<'a, S> {
             ObjectType::Snapshot => {
                 Content::Snapshot(serde_json::from_slice(&content).map_err(|_| Error::Payload)?)
             }
-            ObjectType::Ack => Content::Ack,
+            ObjectType::Ack => {
+                Content::Ack(serde_json::from_slice(&content).map_err(|_| Error::Payload)?)
+            }
             ObjectType::Live => return Err(Error::Suite.into()),
         })
     }
@@ -463,18 +476,24 @@ impl<'a, S: Store> Session<'a, S> {
         let merged = pulled.batches.values().flatten().map(|b| b.size).sum();
         note_merged(pool, &self.record.link, merged).await?;
         self.record.cursor = pulled.cursor;
+        for (did, vv) in &pulled.acks {
+            record_ack(pool, did, vv).await?;
+        }
+        for logged in &pulled.manifests {
+            record_manifest(pool, logged).await?;
+        }
+        record_links(pool, &pulled.links).await?;
         if pulled.consumed > 0 {
-            let vv: BTreeMap<&String, u64> = pulled
-                .positions
-                .iter()
-                .map(|(did, p)| (did, p.seq))
-                .collect();
-            self.write(
-                pool,
-                ObjectType::Ack,
-                &to_canonical_json(&serde_json::json!({ "vv": vv })),
-            )
-            .await?;
+            let ack = Ack {
+                vv: pulled
+                    .positions
+                    .iter()
+                    .map(|(did, p)| (did.clone(), p.seq))
+                    .collect(),
+            };
+            self.write(pool, ObjectType::Ack, &to_canonical_json(&ack))
+                .await?;
+            record_ack(pool, &hex::encode(self.device.did), &ack.vv).await?;
         }
         Ok(())
     }
